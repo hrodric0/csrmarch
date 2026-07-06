@@ -1,0 +1,109 @@
+# =============================================================================
+# CSMR Composition Manifest — Docker Compose (Local Development)
+#
+# This is a local development version of the CSMR composition that uses
+# Docker Compose service names instead of Kubernetes DNS names.
+#
+# Service addresses map to the sidecar containers in docker-compose.yml:
+#   - kvs-*: KeyValueStore app with Paxos sidecar on port 8081
+#   - log-*: LogService app with Paxos sidecar on port 8082
+# =============================================================================
+apiVersion: csmr.ufsc.br/v1alpha1
+kind: CsmrComposition
+metadata:
+  name: kvs-with-logging
+  namespace: csmr-poc
+
+spec:
+  toleratedFailures: 1
+
+  # ── Service definitions ────────────────────────────────────────────────────
+  services:
+
+    kv_store:
+      addresses:
+        - "sidecar-kvs-0:9000"
+        - "sidecar-kvs-1:9000"
+        - "sidecar-kvs-2:9000"
+      operations:
+        - method: "Get"
+          params:
+            - name: key
+              type: string
+          returns: string
+
+        - method: "Put"
+          params:
+            - name: key
+              type: string
+            - name: value
+              type: string
+          returns: void
+
+    logger:
+      addresses:
+        - "sidecar-log-0:9000"
+        - "sidecar-log-1:9000"
+        - "sidecar-log-2:9000"
+      operations:
+        - method: "Append"
+          params:
+            - name: entry
+              type: string
+          returns: bool
+
+        - method: "Retrieve"
+          params:
+            - name: first
+              type: int
+            - name: last
+              type: int
+          returns: "[]string"
+
+        - method: "Truncate"
+          params:
+            - name: index
+              type: int
+          returns: bool
+
+  # ── Composition rules ──────────────────────────────────────────────────────
+  compositions:
+
+    - name: "ExposeGet"
+      type: "Addition"
+      method: "Get"
+      service_operation: "kv_store.Get"
+
+    - name: "PutWithLogging"
+      type: "Composition"
+      method: "Put"
+      params:
+        - name: key
+          type: string
+        - name: value
+          type: string
+      returns: void
+      input_mapper: "PutInputMapper"
+      output_function: "KvsOutputFunction"
+      routing:
+        - target_service: "kv_store"
+          target_method: "Put"
+        - target_service: "logger"
+          target_method: "Append"
+          entry_format: "put({key},{value})"
+
+    - name: "GetWithLogging"
+      type: "Composition"
+      method: "GetAudited"
+      params:
+        - name: key
+          type: string
+      returns: string
+      input_mapper: "GetInputMapper"
+      output_function: "KvsOutputFunction"
+      routing:
+        - target_service: "kv_store"
+          target_method: "Get"
+        - target_service: "logger"
+          target_method: "Append"
+          entry_format: "get({key})"

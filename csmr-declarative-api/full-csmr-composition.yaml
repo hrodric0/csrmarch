@@ -1,0 +1,274 @@
+# =============================================================================
+# CSMR Composition Manifest — Full Dissertation Scenarios
+#
+# Demonstrates all 4 composition scenarios from Alves (2026):
+#   1. Adding Operations (ExposeLockAcquire)
+#   2. Extending Semantics (GetWithLogging, PutWithLogging)
+#   3. Argument Partition (PartitionedKVS)
+#   4. Removing Operations (RemoveRSA)
+# =============================================================================
+apiVersion: csmr.ufsc.br/v1alpha1
+kind: CsmrComposition
+metadata:
+  name: full-csmr-composition
+  namespace: csmr-poc
+
+spec:
+  toleratedFailures: 1
+
+  # ── Service definitions ────────────────────────────────────────────────────────
+  services:
+    kv_store:
+      addresses:
+        - "csmr-kvs-0.csmr-kvs.csmr-poc.svc.cluster.local:9090"
+        - "csmr-kvs-1.csmr-kvs.csmr-poc.svc.cluster.local:9090"
+        - "csmr-kvs-2.csmr-kvs.csmr-poc.svc.cluster.local:9090"
+      operations:
+        - method: "Get"
+          params:
+            - name: "key"
+              type: "string"
+          returns: "string"
+
+        - method: "Put"
+          params:
+            - name: "key"
+              type: "string"
+            - name: "value"
+              type: "string"
+          returns: "void"
+
+        - method: "Delete"
+          params:
+            - name: "key"
+              type: "string"
+          returns: "bool"
+
+    logger:
+      addresses:
+        - "csmr-log-0.csmr-log.csmr-poc.svc.cluster.local:9091"
+        - "csmr-log-1.csmr-log.csmr-poc.svc.cluster.local:9091"
+        - "csmr-log-2.csmr-log.csmr-poc.svc.cluster.local:9091"
+      operations:
+        - method: "Append"
+          params:
+            - name: "entry"
+              type: "string"
+          returns: "bool"
+
+        - method: "Retrieve"
+          params:
+            - name: "first"
+              type: "int"
+            - name: "last"
+              type: "int"
+          returns: "[]string"
+
+    lock_service:
+      addresses:
+        - "csmr-lock-0.csmr-lock.csmr-poc.svc.cluster.local:9092"
+        - "csmr-lock-1.csmr-lock.csmr-poc.svc.cluster.local:9092"
+        - "csmr-lock-2.csmr-lock.csmr-poc.svc.cluster.local:9092"
+      operations:
+        - method: "Acquire"
+          params:
+            - name: "lockName"
+              type: "string"
+            - name: "timeout"
+              type: "int"
+          returns: "bool"
+
+        - method: "Release"
+          params:
+            - name: "lockName"
+              type: "string"
+          returns: "bool"
+
+    crypto_service:
+      addresses:
+        - "csmr-crypto-0.csmr-crypto.csmr-poc.svc.cluster.local:9093"
+        - "csmr-crypto-1.csmr-crypto.csmr-poc.svc.cluster.local:9093"
+        - "csmr-crypto-2.csmr-crypto.csmr-poc.svc.cluster.local:9093"
+      operations:
+        - method: "Sign_RSA"
+          params:
+            - name: "message"
+              type: "bytes"
+            - name: "privateKey"
+              type: "bytes"
+          returns: "bytes"
+
+        - method: "Sign_MLDSA"
+          params:
+            - name: "message"
+              type: "bytes"
+            - name: "privateKey"
+              type: "bytes"
+          returns: "bytes"
+
+        - method: "Verify_RSA"
+          params:
+            - name: "message"
+              type: "bytes"
+            - name: "signature"
+              type: "bytes"
+            - name: "publicKey"
+              type: "bytes"
+          returns: "bool"
+
+        - method: "Verify_MLDSA"
+          params:
+            - name: "message"
+              type: "bytes"
+            - name: "signature"
+              type: "bytes"
+            - name: "publicKey"
+              type: "bytes"
+          returns: "bool"
+
+    kv_store_ring1:
+      addresses:
+        - "csmr-kvs-ring1-0.csmr-kvs-ring1.csmr-poc.svc.cluster.local:9090"
+        - "csmr-kvs-ring1-1.csmr-kvs-ring1.csmr-poc.svc.cluster.local:9090"
+        - "csmr-kvs-ring1-2.csmr-kvs-ring1.csmr-poc.svc.cluster.local:9090"
+      operations:
+        - method: "Put"
+          params:
+            - name: "key"
+              type: "string"
+            - name: "value"
+              type: "string"
+          returns: "void"
+        - method: "Get"
+          params:
+            - name: "key"
+              type: "string"
+          returns: "string"
+
+    kv_store_ring2:
+      addresses:
+        - "csmr-kvs-ring2-0.csmr-kvs-ring2.csmr-poc.svc.cluster.local:9090"
+        - "csmr-kvs-ring2-1.csmr-kvs-ring2.csmr-poc.svc.cluster.local:9090"
+        - "csmr-kvs-ring2-2.csmr-kvs-ring2.csmr-poc.svc.cluster.local:9090"
+      operations:
+        - method: "Put"
+          params:
+            - name: "key"
+              type: "string"
+            - name: "value"
+              type: "string"
+          returns: "void"
+        - method: "Get"
+          params:
+            - name: "key"
+              type: "string"
+          returns: "string"
+
+  # ── Composition rules ──────────────────────────────────────────────────────────
+  compositions:
+    # ── Scenario 1: Adding SMR Operations ────────────────────────────────────────
+    # Directly exposes the Lock Service's Acquire operation to clients.
+    # This adds a new operation to the system without modifying the core KVS.
+    - name: "ExposeLockAcquire"
+      type: "Addition"
+      method: "acquire"
+      service_operation: "lock_service.Acquire"
+
+    - name: "ExposeLockRelease"
+      type: "Addition"
+      method: "release"
+      service_operation: "lock_service.Release"
+
+    # ── Scenario 2: Extending Operations' Execution ──────────────────────────────
+    # PutWithLogging: routes Put to both KVS and Logger simultaneously.
+    # Requires InputMapper (PutInputMapper) and OutputFunction (KvsOutputFunction).
+    - name: "PutWithLogging"
+      type: "Composition"
+      method: "put"
+      input_mapper: "PutInputMapper"
+      output_function: "KvsOutputFunction"
+      routing:
+        - target_service: "kv_store"
+          target_method: "Put"
+        - target_service: "logger"
+          target_method: "Append"
+          entry_format: "put({key},{value})"
+
+    # GetWithLogging: audits reads too (optional, shown for completeness).
+    - name: "GetWithLogging"
+      type: "Composition"
+      method: "get"
+      input_mapper: "GetInputMapper"
+      output_function: "KvsOutputFunction"
+      routing:
+        - target_service: "kv_store"
+          target_method: "Get"
+        - target_service: "logger"
+          target_method: "Append"
+          entry_format: "get({key})"
+
+    # ── Scenario 3: Argument Partition (Sharding) ────────────────────────────────
+    # PartitionedKVS: routes puts based on key first character.
+    # Keys starting with 'a-m' go to ring1, 'n-z' go to ring2.
+    # This distributes load across rings while maintaining atomicity per key.
+    - name: "PartitionedKVS"
+      type: "Partition"
+      method: "partitioned_put"
+      partition_by: "key"
+      partition_rules:
+        - key_range: "a-m"
+          target_service: "kv_store_ring1"
+          target_method: "Put"
+        - key_range: "n-z"
+          target_service: "kv_store_ring2"
+          target_method: "Put"
+        - regex: "^[0-9]"
+          target_service: "kv_store_ring1"
+          target_method: "Put"
+
+    # Alternative: Hash-based partitioning with 3 rings
+    - name: "HashPartitionedKVS"
+      type: "Partition"
+      method: "hash_put"
+      partition_by: "key"
+      partition_rules:
+        - hash_mod: 3
+          hash_value: 0
+          target_service: "kv_store"
+          target_method: "Put"
+        - hash_mod: 3
+          hash_value: 1
+          target_service: "kv_store_ring1"
+          target_method: "Put"
+        - hash_mod: 3
+          hash_value: 2
+          target_service: "kv_store_ring2"
+          target_method: "Put"
+
+    # ── Scenario 4: Removing Operations ──────────────────────────────────────────
+    # Deprecates RSA operations while keeping ML-DSA available.
+    # Clients calling "sign_rsa" or "verify_rsa" will receive an error.
+    - name: "RemoveRSA"
+      type: "Addition"
+      method: "sign_rsa"
+      service_operation: "crypto_service.Sign_RSA"
+      deprecated: true
+      removal_reason: "RSA-2048 is deprecated per NIST guidelines. Use ML-DSA instead."
+
+    - name: "RemoveVerifyRSA"
+      type: "Addition"
+      method: "verify_rsa"
+      service_operation: "crypto_service.Verify_RSA"
+      deprecated: true
+      removal_reason: "RSA verification is deprecated. Use ML-DSA instead."
+
+    # Expose the new ML-DSA operations as replacements
+    - name: "ExposeMLDSASign"
+      type: "Addition"
+      method: "sign"
+      service_operation: "crypto_service.Sign_MLDSA"
+
+    - name: "ExposeMLDSAVerify"
+      type: "Addition"
+      method: "verify"
+      service_operation: "crypto_service.Verify_MLDSA"

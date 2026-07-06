@@ -1,0 +1,111 @@
+# =============================================================================
+# ChainingSMR Composition — PoC 2 (Alves 2026, Future Work)
+#
+# Demonstrates "Chaining SMRs" where the output of one state machine
+# serves directly as the input to a subsequent state machine, creating
+# an automated feedback loop.
+#
+# Example Workflow: PRNG → Atomic Counter
+#   1. PRNG Service generates a pseudo-random number
+#   2. Counter Service sets its initial value to that random number
+#   3. The result is a counter initialized with a random seed
+# =============================================================================
+apiVersion: csmr.ufsc.br/v1alpha1
+kind: CsmrComposition
+metadata:
+  name: chaining-smr-composition
+  namespace: csmr-poc
+
+spec:
+  toleratedFailures: 1
+
+  # ── Service definitions ────────────────────────────────────────────────────────
+  services:
+    prng_service:
+      addresses:
+        - "csmr-prng-0.csmr-prng.csmr-poc.svc.cluster.local:9094"
+        - "csmr-prng-1.csmr-prng.csmr-poc.svc.cluster.local:9094"
+        - "csmr-prng-2.csmr-prng.csmr-poc.svc.cluster.local:9094"
+      operations:
+        - method: "Generate"
+          params:
+            - name: "min"
+              type: "int"
+            - name: "max"
+              type: "int"
+          returns: "int"
+
+    counter_service:
+      addresses:
+        - "csmr-counter-0.csmr-counter.csmr-poc.svc.cluster.local:9095"
+        - "csmr-counter-1.csmr-counter.csmr-poc.svc.cluster.local:9095"
+        - "csmr-counter-2.csmr-counter.csmr-poc.svc.cluster.local:9095"
+      operations:
+        - method: "SetValue"
+          params:
+            - name: "value"
+              type: "int"
+          returns: "bool"
+
+        - method: "GetValue"
+          params: []
+          returns: "int"
+
+        - method: "Increment"
+          params:
+            - name: "amount"
+              type: "int"
+          returns: "int"
+
+  # ── Composition rules ──────────────────────────────────────────────────────────
+  compositions:
+    # ── PoC 2: ChainingSMR (PRNG → Counter) ──────────────────────────────────────
+    # Generates a random number and initializes an atomic counter with it
+    - name: "InitCounterWithRandom"
+      type: "Chaining"
+      method: "init_counter"
+      chaining_stages:
+        # Stage 1: Generate random number from PRNG service
+        - stage_order: 1
+          target_service: "prng_service"
+          target_method: "Generate"
+          output_field: "result"
+          input_mapper: "PrngInputMapper"
+          wait_for_completion: true
+
+        # Stage 2: Set counter value with the random number from Stage 1
+        - stage_order: 2
+          target_service: "counter_service"
+          target_method: "SetValue"
+          output_field: "result"
+          input_mapper: "CounterValueMapper"
+          wait_for_completion: true
+      return_intermediate: true  # Return results from all stages
+
+    # ── Advanced Chaining: PRNG → Counter → Increment ───────────────────────────────
+    # Demonstrates longer chains with multiple transformations
+    - name: "RandomIncrement"
+      type: "Chaining"
+      method: "random_increment"
+      chaining_stages:
+        - stage_order: 1
+          target_service: "prng_service"
+          target_method: "Generate"
+          output_field: "result"
+          input_mapper: "PrngInputMapper"
+          wait_for_completion: true
+
+        - stage_order: 2
+          target_service: "counter_service"
+          target_method: "SetValue"
+          output_field: "result"
+          input_mapper: "CounterValueMapper"
+          wait_for_completion: true
+
+        - stage_order: 3
+          target_service: "counter_service"
+          target_method: "Increment"
+          output_field: "result"
+          input_mapper: "IncrementInputMapper"
+          wait_for_completion: true
+      return_intermediate: false  # Return only final result

@@ -1,0 +1,43 @@
+# =============================================================================
+# Dockerfile — csmr-sidecar-paxos (URingPaxos Wrapper Sidecar)
+# =============================================================================
+FROM eclipse-temurin:17-jre-alpine
+
+LABEL description="CSMR Paxos Sidecar — U-Ring Paxos TCP Unicast wrapper with MultiLearnerRole, StableStorage support"
+
+RUN addgroup -S csmr && adduser -S csmr -G csmr
+WORKDIR /app
+
+# Create directory for disk-based StableStorage (Constraint #4)
+# Must be done before switching to non-root user
+RUN mkdir -p /data/paxos && \
+    chown -R csmr:csmr /data && \
+    chmod 775 /data /data/paxos
+
+USER csmr
+
+COPY csmr-execution-layer/csmr-sidecar-paxos/target/csmr-sidecar-paxos-*.jar app.jar
+
+# Volume mount for disk-based StableStorage (used in production)
+VOLUME ["/data/paxos"]
+
+# Environment variables (overridden by Kubernetes via env: in the pod spec)
+# Constraint #4: StableStorage configuration
+ENV STABLE_STORAGE_TYPE=InMemory
+ENV STABLE_STORAGE_PATH=/data/paxos
+ENV ZOOKEEPER_CONNECT=localhost:2181
+ENV RING_ID=kv_store_Put
+ENV NODE_ID=0
+ENV APP_PORT=8081
+ENV SERVER_PORT=9000
+
+# Constraint #2: Propose timeout (seconds) for CountDownLatch waiting
+ENV PROPOSE_TIMEOUT_SECONDS=10
+
+# Increase heap and direct memory to support URingPaxos sidecar workloads
+ENTRYPOINT ["java", \
+  "-Xms256m", "-Xmx1024m", \
+  "-XX:MaxDirectMemorySize=1024m", \
+  "-XX:MaxRAMPercentage=75", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]

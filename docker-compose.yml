@@ -1,0 +1,413 @@
+# =============================================================================
+# docker-compose.yml — CSMR local development stack
+#
+# Brings up the full composition locally without Kubernetes.
+# Useful for rapid iteration on the PoC before deploying to Minikube.
+#
+# Architecture (Docker Compose specific):
+# - All services share the same Docker network
+# - Sidecars communicate with apps via 127.0.0.1 (localhost)
+# - Proxy routes to sidecars on port 9000
+# - Sidecars communicate with each other via service names
+#
+# Usage:
+#   docker compose up --build
+#   curl -X POST http://localhost:8080/api/command \
+#     -H 'Content-Type: application/json' \
+#     -d '{"id":1,"method":"put","params":{"key":"hello","value":"world"}}'
+# =============================================================================
+
+services:
+
+  # ── ZooKeeper ────────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── ZooKeeper ring-membership initializer (one-shot) ─────────────────────────
+  # In Kubernetes the control-plane operator provisions /csmr/rings/* via
+  # ZooKeeperRingProvisioner. Docker Compose has no control plane, so this one-shot
+  # job seeds the CSMR membership layer that each sidecar's ZooKeeperRingDiscovery
+  # reads at startup (path /csmr/rings/<ringId>/members/<nodeId>, data = sidecar
+  # address). Without it sidecars discover 0 members and start degenerate 1-node
+  # rings. Idempotent (tolerates NodeExists) so it re-seeds on every `up`, including
+  # after a ZooKeeper restart wipes the (non-persistent) tree. All sidecars
+  # depend_on this via service_completed_successfully.
+  zk-init:
+    image: confluentinc/cp-zookeeper:7.6.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    ports: []
+    command:
+      - |
+        set -e
+        ZK=zookeeper:2181
+        create() {
+          # create <path> [data]; ignore "already exists"
+          zookeeper-shell "$$ZK" create "$$1" "$${2:-}" 2>&1 | grep -v 'NodeExists' || true
+        }
+        echo "Provisioning /csmr/rings membership in ZooKeeper at $$ZK ..."
+        create /csmr ''
+        create /csmr/rings ''
+        create /csmr/rings/kv_store_Put ''
+        create /csmr/rings/kv_store_Put/members ''
+        create /csmr/rings/kv_store_Put/members/0 'sidecar-kvs-0:9000'
+        create /csmr/rings/kv_store_Put/members/1 'sidecar-kvs-1:9000'
+        create /csmr/rings/kv_store_Put/members/2 'sidecar-kvs-2:9000'
+        create /csmr/rings/logger_Append ''
+        create /csmr/rings/logger_Append/members ''
+        create /csmr/rings/logger_Append/members/0 'sidecar-log-0:9000'
+        create /csmr/rings/logger_Append/members/1 'sidecar-log-1:9000'
+        create /csmr/rings/logger_Append/members/2 'sidecar-log-2:9000'
+        echo "ZooKeeper ring membership provisioned."
+        # --- URingPaxos acceptor-watch race fix (cold start) ---
+        # URingPaxos RingManager.init()->getConfig() reads /ringpaxos/topology<N>/acceptors
+        # with a one-shot watch (RingManager.java:111) BEFORE this node registers its own
+        # acceptor znode (Node.java:129 init runs before :143 registerRole). On a cold start
+        # the /acceptors parent does not exist yet, so getChildren throws NoNodeException
+        # (caught/ignored at RingManager.java:120): NO watch is armed and `last_acceptor`
+        # stays frozen at 0. process()'s acceptor branch then never fires, so Phase1/Phase1Range
+        # tokens are never re-addressed to the coordinator (the last_acceptor==self check fails)
+        # and return to the coordinator with quorum 0 -> "ring end without quorum (0)" ->
+        # "Coordinator timeout in phase1 reservation" -> proxy "Quorum not reached".
+        # Pre-creating the PERSISTENT parent makes getChildren return [] and ARM the watch, so
+        # subsequent NodeChildrenChanged events recompute last_acceptor=max=2 on every node.
+        # URingPaxos creates this same parent lazily as PERSISTENT guarded by an exists() check
+        # (TopologyManager.java:486-488), so pre-creating it is idempotent and skips that create
+        # (no NodeExistsException). topology1=kv_store_Put, topology2=logger_Append.
+        echo "Pre-creating URingPaxos /acceptors parents to arm the election watch ..."
+        create /ringpaxos ''
+        create /ringpaxos/topology1 ''
+        create /ringpaxos/topology1/acceptors ''
+        create /ringpaxos/topology2 ''
+        create /ringpaxos/topology2/acceptors ''
+        echo "URingPaxos acceptor parents provisioned."
+
+  # ── CSMR Control Plane (Operator) ────────────────────────────────────────────
+  # Note: Control plane requires Kubernetes API. Disabled in Docker Compose mode.
+  # Uncomment and configure kubeconfig if running with Minikube.
+  # control-plane:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/Dockerfile.control-plane
+  #   environment:
+  #     ZOOKEEPER_CONNECT: "zookeeper:2181"
+  #   volumes:
+  #     - ~/.kube/config:/home/csmr/.kube/config  # Mount kubeconfig for Minikube
+  #   depends_on:
+  #     zookeeper:
+  #       condition: service_healthy
+
+  # ── CSMR Proxy ───────────────────────────────────────────────────────────────
+  proxy:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.proxy
+    ports:
+      - "8080:8080"
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      sidecar-kvs-0:
+        condition: service_healthy
+      sidecar-kvs-1:
+        condition: service_healthy
+      sidecar-kvs-2:
+        condition: service_healthy
+      sidecar-log-0:
+        condition: service_healthy
+      sidecar-log-1:
+        condition: service_healthy
+      sidecar-log-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── KVS Ring: 3 replicas (app + sidecar each) ─────────────────────────────────
+  kvs-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-kvs
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-kvs-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "kv_store_Put"
+      RING_ID_NUMERIC: "1"
+      RING_SIZE: "3"
+      NODE_ID: "0"
+      APP_PORT: "8081"
+      APP_HOST: "kvs-0"  # Docker Compose service name for app
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19000:9000"  # Expose sidecar on host port 19000
+    expose:
+      - "9000"
+    # Node 0 registers its acceptor znode FIRST. Coordinator election is driven
+    # in-sidecar: PaxosRingNode.startCoordinatorRoleIfElected() polls
+    # RingManager.getCoordinatorID() on node 0 and, once node 0 is the elected
+    # coordinator id, starts `new CoordinatorRole(rm)` directly. Because node 0
+    # registers before any follower, no follower ever transiently sees itself as
+    # min(acceptors), so URingPaxos's own notifyNewCoordinator() never spuriously
+    # starts a competing CoordinatorRole on node 1/2 — there is exactly one
+    # coordinator (node 0). The followers depend_on this service so it wins the race.
+    depends_on:
+      kvs-0:
+        condition: service_started
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  kvs-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-kvs
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-kvs-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "kv_store_Put"
+      RING_ID_NUMERIC: "1"
+      RING_SIZE: "3"
+      NODE_ID: "1"
+      APP_PORT: "8081"
+      APP_HOST: "kvs-1"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19001:9000"
+    expose:
+      - "9000"
+    # Follower: registers its acceptor znode AFTER node 0 (depends_on sidecar-kvs-0)
+    # so it never transiently becomes min(acceptors) and never starts a competing
+    # CoordinatorRole — see the note on sidecar-kvs-0.
+    depends_on:
+      kvs-1:
+        condition: service_started
+      sidecar-kvs-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  kvs-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-kvs
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-kvs-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "kv_store_Put"
+      RING_ID_NUMERIC: "1"
+      RING_SIZE: "3"
+      NODE_ID: "2"
+      APP_PORT: "8081"
+      APP_HOST: "kvs-2"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19002:9000"
+    expose:
+      - "9000"
+    # Follower: registers AFTER node 0 (depends_on sidecar-kvs-0) — see sidecar-kvs-0.
+    depends_on:
+      kvs-2:
+        condition: service_started
+      sidecar-kvs-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ── Log Ring: 3 replicas (app + sidecar each) ──────────────────────────────────
+  log-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-log
+    environment:
+      SERVER_PORT: "8082"
+    expose:
+      - "8082"
+
+  sidecar-log-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "logger_Append"
+      RING_ID_NUMERIC: "2"
+      RING_SIZE: "3"
+      NODE_ID: "0"
+      APP_PORT: "8082"
+      APP_HOST: "log-0"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19010:9000"
+    expose:
+      - "9000"
+    # Node 0 registers its acceptor znode FIRST; coordinator election is driven
+    # in-sidecar (single coordinator) — see the detailed note on sidecar-kvs-0.
+    depends_on:
+      log-0:
+        condition: service_started
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  log-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-log
+    environment:
+      SERVER_PORT: "8082"
+    expose:
+      - "8082"
+
+  sidecar-log-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "logger_Append"
+      RING_ID_NUMERIC: "2"
+      RING_SIZE: "3"
+      NODE_ID: "1"
+      APP_PORT: "8082"
+      APP_HOST: "log-1"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19011:9000"
+    expose:
+      - "9000"
+    # Follower: registers AFTER node 0 (depends_on sidecar-log-0) — see sidecar-kvs-0.
+    depends_on:
+      log-1:
+        condition: service_started
+      sidecar-log-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  log-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-log
+    environment:
+      SERVER_PORT: "8082"
+    expose:
+      - "8082"
+
+  sidecar-log-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "logger_Append"
+      RING_ID_NUMERIC: "2"
+      RING_SIZE: "3"
+      NODE_ID: "2"
+      APP_PORT: "8082"
+      APP_HOST: "log-2"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19012:9000"
+    expose:
+      - "9000"
+    # Follower: registers AFTER node 0 (depends_on sidecar-log-0) — see sidecar-kvs-0.
+    depends_on:
+      log-2:
+        condition: service_started
+      sidecar-log-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s

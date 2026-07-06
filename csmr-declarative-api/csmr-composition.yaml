@@ -1,0 +1,142 @@
+# =============================================================================
+# CSMR Composition Manifest — csmr-composition.yaml
+#
+# Declarative specification for the "GetWithLogging" composition (PoC).
+# Based on the Declarative API defined in Section 6.2.1, Alves (2026).
+#
+# This file is consumed by:
+#   1. The Kubernetes Operator (CsmrCompositionOperator) at deploy time.
+#   2. The Composition Checker (Algorithm 1, Alves 2026 p.65).
+#   3. The Proxy RoutingTable and PluginRegistry at runtime.
+#
+# Formal composition (Definition 19, Alves 2026):
+#   R = R₁ ∪ R₂
+#   R₁ = kv_store replicas × {Get, Put}
+#   R₂ = logger    replicas × {Append}
+#   f  = min{f₁, f₂} = min{1, 1} = 1
+#   |R(x)| = 3 >= f + 1 = 2  ✓  (composition is valid)
+# =============================================================================
+
+apiVersion: csmr.ufsc.br/v1alpha1
+kind: CsmrComposition
+metadata:
+  name: kvs-with-logging
+  namespace: csmr-poc
+
+spec:
+  # f = number of crash failures to tolerate per service.
+  # The Checker enforces |R(x)| >= f + 1 for every operation x.
+  toleratedFailures: 1
+
+  # ── Service definitions ────────────────────────────────────────────────────
+  # Each service maps to one SMR group in the composition.
+  # Addresses point to the Paxos Sidecar listener port of each replica pod.
+  services:
+
+    kv_store:
+      # SMR 2 — Key-Value Store (Alves 2026, Section 4.2)
+      # "fast ring": in-memory operations, ~0.5 ms latency
+      addresses:
+        - "csmr-kvs-0.csmr-kvs.csmr-poc.svc.cluster.local:9090"
+        - "csmr-kvs-1.csmr-kvs.csmr-poc.svc.cluster.local:9090"
+        - "csmr-kvs-2.csmr-kvs.csmr-poc.svc.cluster.local:9090"
+      operations:
+        - method: "Get"
+          params:
+            - name: key
+              type: string
+          returns: string
+
+        - method: "Put"
+          params:
+            - name: key
+              type: string
+            - name: value
+              type: string
+          returns: void
+
+    logger:
+      # SMR 3 — Logging / Audit Service (Alves 2026, Section 4.2)
+      # "slow ring": disk-backed append, ~8.5 ms latency
+      # Provides transparent audit — client never sees its responses (filtered by f(D))
+      addresses:
+        - "csmr-log-0.csmr-log.csmr-poc.svc.cluster.local:9091"
+        - "csmr-log-1.csmr-log.csmr-poc.svc.cluster.local:9091"
+        - "csmr-log-2.csmr-log.csmr-poc.svc.cluster.local:9091"
+      operations:
+        - method: "Append"
+          params:
+            - name: entry
+              type: string
+          returns: bool
+
+        - method: "Retrieve"
+          params:
+            - name: first
+              type: int
+            - name: last
+              type: int
+          returns: "[]string"
+
+        - method: "Truncate"
+          params:
+            - name: index
+              type: int
+          returns: bool
+
+  # ── Composition rules ──────────────────────────────────────────────────────
+  # Maps client-facing operations to one or more service operations.
+  # Type "Addition"    → single service, no f(D) reduction needed.
+  # Type "Composition" → multiple services, requires input_mapper + output_function.
+  compositions:
+
+    # Direct exposure of Get: KVS only (no audit for reads in this PoC)
+    - name: "ExposeGet"
+      type: "Addition"
+      method: "Get"
+      service_operation: "kv_store.Get"
+
+    # PutWithLogging: routes Put to both KVS and Logger simultaneously.
+    # Implements "Extending SMR operations' execution" (Section 5.1.2, Alves 2026).
+    #
+    # Flow (Example 20, Alves 2026 p.52):
+    #   client.put("k","v")
+    #     → mcast(kv_store_group, Put("k","v"))     → KVS stores the pair
+    #     → mcast(logger_group,   Append(put("k","v"))) → Log records the operation
+    #   f(D) = filter D by group="kv_store" → return KVS ack to client
+    #   Logger ack is silently discarded (transparent audit)
+    - name: "PutWithLogging"
+      type: "Composition"
+      method: "Put"
+      params:
+        - name: key
+          type: string
+        - name: value
+          type: string
+      returns: void
+      input_mapper: "PutInputMapper"
+      output_function: "KvsOutputFunction"
+      routing:
+        - target_service: "kv_store"
+          target_method: "Put"
+        - target_service: "logger"
+          target_method: "Append"
+          # The logger receives put("k","v") serialised as the entry argument
+          entry_format: "put({key},{value})"
+
+    # GetWithLogging: audits reads too (optional, shown for completeness)
+    - name: "GetWithLogging"
+      type: "Composition"
+      method: "GetAudited"
+      params:
+        - name: key
+          type: string
+      returns: string
+      input_mapper: "GetInputMapper"
+      output_function: "KvsOutputFunction"
+      routing:
+        - target_service: "kv_store"
+          target_method: "Get"
+        - target_service: "logger"
+          target_method: "Append"
+          entry_format: "get({key})"

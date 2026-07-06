@@ -1,0 +1,21 @@
+# =============================================================================
+# Dockerfile — csmr-app-kvs (Key-Value Store, SMR 2)
+# =============================================================================
+FROM eclipse-temurin:17-jre-alpine
+
+LABEL description="CSMR KVS — deterministic in-memory Key-Value Store (SMR 2, Alves 2026)"
+
+RUN addgroup -S csmr && adduser -S csmr -G csmr
+USER csmr
+WORKDIR /app
+
+COPY csmr-execution-layer/csmr-app-kvs/target/csmr-app-kvs-*.jar app.jar
+
+EXPOSE 8081
+
+ENV SERVER_PORT=8081
+
+ENTRYPOINT ["java", \
+  "-Xms128m", "-Xmx512m", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]

@@ -1,0 +1,145 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: csmrcompositions.csmr.ufsc.br
+spec:
+  group: csmr.ufsc.br
+  names:
+    plural: csmrcompositions
+    singular: csmrcomposition
+    kind: CsmrComposition
+    shortNames:
+      - csmr
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["toleratedFailures", "services", "compositions"]
+              properties:
+                toleratedFailures:
+                  type: integer
+                  minimum: 1
+                  description: "f — number of crash failures each service must tolerate (|R(x)| >= f+1)"
+                services:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    required: ["addresses", "operations"]
+                    properties:
+                      addresses:
+                        type: array
+                        items:
+                          type: string
+                          description: "Replica addresses in 'host:port' format"
+                      operations:
+                        type: array
+                        items:
+                          type: object
+                          required: ["method"]
+                          properties:
+                            method:
+                              type: string
+                              description: "Operation name (e.g., Get, Put, Acquire)"
+                            params:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  name: { type: string }
+                                  type: { type: string }
+                              description: "Operation parameters with types"
+                            returns:
+                              type: string
+                              description: "Return type"
+                compositions:
+                  type: array
+                  items:
+                    type: object
+                    required: ["name", "type", "method"]
+                    properties:
+                      name: { type: string }
+                      type:
+                        type: string
+                        enum: [Addition, Composition, Partition, Chaining]
+                        description: "Composition type: Addition, Composition, Partition, or Chaining (PoC 2)"
+                      method: { type: string }
+                      service_operation:
+                        type: string
+                        description: "For Addition type: service.operation (e.g., lock_service.Acquire)"
+                      input_mapper:
+                        type: string
+                        description: "Java class implementing InputMapper (Composition/Chaining)"
+                      output_function:
+                        type: string
+                        description: "Java class implementing OutputFunctionPlugin (Composition)"
+                      partition_by:
+                        type: string
+                        description: "Parameter name to partition on (Partition type)"
+                      partition_rules:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            key_range: { type: string, description: "Alphabetic range, e.g., 'a-m'" }
+                            target_service: { type: string }
+                            target_method: { type: string }
+                            hash_mod: { type: integer, description: "Modulus for hash-based partitioning" }
+                            hash_value: { type: integer, description: "Expected hash result" }
+                            regex: { type: string, description: "Regex pattern for matching" }
+                      routing:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            target_service: { type: string }
+                            target_method: { type: string }
+                            entry_format: { type: string, description: "Entry format template, e.g., put({key},{value})" }
+                      deprecated:
+                        type: boolean
+                        default: false
+                        description: "Whether this operation is deprecated"
+                      removal_reason:
+                        type: string
+                        description: "Reason for deprecation"
+                      chaining_stages:
+                        type: array
+                        description: "List of stages for Chaining type (PoC 2)"
+                        items:
+                          type: object
+                          required: ["stage_order", "target_service", "target_method"]
+                          properties:
+                            stage_order: { type: integer, description: "Execution order (1, 2, 3, ...)" }
+                            target_service: { type: string }
+                            target_method: { type: string }
+                            output_field: { type: string, description: "Field to extract from previous output" }
+                            input_mapper: { type: string, description: "Mapper for transforming output to input" }
+                            wait_for_completion:
+                              type: boolean
+                              default: true
+                              description: "Wait for stage completion before proceeding"
+                      return_intermediate:
+                        type: boolean
+                        default: false
+                        description: "Whether the chain returns intermediate results"
+            status:
+              type: object
+              properties:
+                phase: { type: string, enum: [Pending, Ready, Invalid, Error, Warning] }
+                message: { type: string }
+                violations:
+                  type: array
+                  items: { type: string }
+                  description: "List of blocking validation violations"
+                warnings:
+                  type: array
+                  items: { type: string }
+                  description: "List of non-blocking warnings (e.g., load balancing issues)"
+      subresources:
+        status: {}
+  scope: Namespaced

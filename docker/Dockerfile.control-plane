@@ -1,0 +1,19 @@
+# =============================================================================
+# Dockerfile — csmr-control-plane (Kubernetes Operator / Checker)
+# =============================================================================
+FROM eclipse-temurin:17-jre-alpine
+
+LABEL maintainer="Rodrigo Bonatto <bonatto@inf.ufsc.br>"
+LABEL description="CSMR Control Plane — Kubernetes Operator implementing the Composition Checker (Alves 2026)"
+
+RUN addgroup -S csmr && adduser -S csmr -G csmr
+USER csmr
+
+WORKDIR /app
+
+COPY csmr-control-plane/target/csmr-control-plane-*-jar-with-dependencies.jar app.jar
+
+ENTRYPOINT ["java", \
+  "-Xms128m", "-Xmx768m", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]

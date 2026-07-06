@@ -1,0 +1,5 @@
+br.ufsc.csmr.proxy.mapper.PutInputMapper
+br.ufsc.csmr.proxy.mapper.GetInputMapper
+br.ufsc.csmr.proxy.mapper.PrngInputMapper
+br.ufsc.csmr.proxy.mapper.CounterValueMapper
+br.ufsc.csmr.proxy.mapper.IncrementInputMapper

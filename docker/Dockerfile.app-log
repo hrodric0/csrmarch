@@ -1,0 +1,21 @@
+# =============================================================================
+# Dockerfile — csmr-app-log (Logging Service, SMR 3)
+# =============================================================================
+FROM eclipse-temurin:17-jre-alpine
+
+LABEL description="CSMR Log — deterministic append-only audit Log Service (SMR 3, Alves 2026)"
+
+RUN addgroup -S csmr && adduser -S csmr -G csmr
+USER csmr
+WORKDIR /app
+
+COPY csmr-execution-layer/csmr-app-log/target/csmr-app-log-*.jar app.jar
+
+EXPOSE 8082
+
+ENV SERVER_PORT=8082
+
+ENTRYPOINT ["java", \
+  "-Xms128m", "-Xmx512m", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]

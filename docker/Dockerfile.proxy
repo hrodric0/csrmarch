@@ -1,0 +1,21 @@
+# =============================================================================
+# Dockerfile — csmr-proxy (API + ReplicaMapper + OutputProcessing)
+# =============================================================================
+FROM eclipse-temurin:17-jre-alpine
+
+LABEL maintainer="Rodrigo Bonatto <bonatto@inf.ufsc.br>"
+LABEL description="CSMR Proxy — ReplicaMapper, OutputProcessing f(D), REST API"
+
+RUN addgroup -S csmr && adduser -S csmr -G csmr
+USER csmr
+
+WORKDIR /app
+
+COPY csmr-proxy/target/csmr-proxy-*.jar app.jar
+
+EXPOSE 8080
+
+ENTRYPOINT ["java", \
+  "-Xms128m", "-Xmx768m", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]
