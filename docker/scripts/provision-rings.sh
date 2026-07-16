@@ -21,7 +21,7 @@ echo "ZooKeeper: $ZK_HOST:$ZK_PORT"
 
 # Wait for ZooKeeper to be ready
 echo "Waiting for ZooKeeper..."
-until zkCli.sh -server "$ZK_HOST:$ZK_PORT" ls / > /dev/null 2>&1; do
+until zookeeper-shell "$ZK_HOST:$ZK_PORT" ls / > /dev/null 2>&1; do
     echo "ZooKeeper not ready yet, waiting..."
     sleep 2
 done
@@ -29,7 +29,7 @@ echo "ZooKeeper is ready!"
 
 # Create base paths
 echo "Creating base paths..."
-zkCli.sh -server "$ZK_HOST:$ZK_PORT" create "$BASE_PATH" "" 2>/dev/null || true
+zookeeper-shell "$ZK_HOST:$ZK_PORT" create "$BASE_PATH" "" 2>/dev/null || true
 
 # Function to create a ring
 create_ring() {
@@ -43,15 +43,15 @@ create_ring() {
     MEMBERS_PATH="$RING_PATH/members"
 
     # Create ring path
-    zkCli.sh -server "$ZK_HOST:$ZK_PORT" create "$RING_PATH" "" 2>/dev/null || true
-    zkCli.sh -server "$ZK_HOST:$ZK_PORT" create "$MEMBERS_PATH" "" 2>/dev/null || true
+    zookeeper-shell "$ZK_HOST:$ZK_PORT" create "$RING_PATH" "" 2>/dev/null || true
+    zookeeper-shell "$ZK_HOST:$ZK_PORT" create "$MEMBERS_PATH" "" 2>/dev/null || true
 
     # Create member znodes
     for MEMBER in $MEMBERS; do
         # Replace : with _ for znode name (colon is illegal)
         MEMBER_ZNODE=$(echo "$MEMBER" | tr ':' '_')
-        zkCli.sh -server "$ZK_HOST:$ZK_PORT" create "$MEMBERS_PATH/$MEMBER_ZNODE" "$MEMBER" 2>/dev/null || \
-        zkCli.sh -server "$ZK_HOST:$ZK_PORT" set "$MEMBERS_PATH/$MEMBER_ZNODE" "$MEMBER"
+        zookeeper-shell "$ZK_HOST:$ZK_PORT" create "$MEMBERS_PATH/$MEMBER_ZNODE" "$MEMBER" 2>/dev/null || \
+        zookeeper-shell "$ZK_HOST:$ZK_PORT" set "$MEMBERS_PATH/$MEMBER_ZNODE" "$MEMBER"
         echo "  Member: $MEMBER"
     done
 }
@@ -70,12 +70,12 @@ echo ""
 echo "=== Ring provisioning complete ==="
 echo ""
 echo "Verifying rings..."
-zkCli.sh -server "$ZK_HOST:$ZK_PORT" ls "$BASE_PATH"
+zookeeper-shell "$ZK_HOST:$ZK_PORT" ls "$BASE_PATH"
 echo ""
 echo "KVS members:"
-zkCli.sh -server "$ZK_HOST:$ZK_PORT" ls "$BASE_PATH/kv_store_Put/members"
+zookeeper-shell "$ZK_HOST:$ZK_PORT" ls "$BASE_PATH/kv_store_Put/members"
 echo ""
 echo "Log members:"
-zkCli.sh -server "$ZK_HOST:$ZK_PORT" ls "$BASE_PATH/logger_Append/members"
+zookeeper-shell "$ZK_HOST:$ZK_PORT" ls "$BASE_PATH/logger_Append/members"
 echo ""
 echo "Done!"

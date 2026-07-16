@@ -180,71 +180,69 @@ public class PaxosRingNode {
             // STABLE_STORAGE_TYPE actually take effect; otherwise the library default applies.
             seedStableStorageConfig();
 
-            // Step 3b: Deterministic single-coordinator gate. A follower (nodeId != 0) must NOT
-            // register its acceptor znode before node 0 does. URingPaxos's RingManager.process()
-            // starts a CoordinatorRole on whichever node first observes itself as min(acceptors)
-            // via a transition of `coordinator`. On a cold start where a follower registers first,
-            // it transiently sees acceptors=={its own id} (min == itself), fires
-            // notifyNewCoordinator(), and starts a CoordinatorRole that is NEVER stopped when node 0
-            // later joins. That stale coordinator duels node 0's coordinator: both issue Phase1/
-            // Phase1Range reservations, mutually poisoning each other's ballots/highest_seen_instance
-            // (AcceptorRole rejects-and-drops any reservation at an instance <= highest_seen), so the
-            // token never returns to either coordinator with quorum → "Coordinator timeout in
-            // phase1range reservation" → proposer timeout → "Quorum not reached". Gating followers on
-            // node 0's acceptor znode guarantees node 0 is always min(acceptors) first, so only node 0
-            // ever becomes coordinator (started in-process below). Deterministic; no fixed sleep.
+            // Step 3b: Ensure acceptors parent znode exists (arms RingManager watch for coordinator election).
+            // zk-init also does this, but we do it idempotently here in case of direct sidecar start.
+            ensureAcceptorsParentExists();
+
+            // Step 3c: Clean up any stale ephemeral acceptor znode for this node from a prior run.
+            // Prevents distorted acceptor set on restart without volume wipe.
+            cleanupStaleAcceptorZnode();
+
+            // Step 3d: Node 0 starts FIRST to register its acceptor znode.
+            // This ensures node 0 becomes min(acceptors) before any follower registers,
+            // so RingManager's watch transition fires correctly on node 0's registration.
+            if (nodeId == 0) {
+                log.info("[{}] Node 0 starting early to register acceptor znode", ringId);
+                paxosNode = new Node(nodeId, zkConnect, rings);
+                paxosNode.start();
+
+                // Step 3e: Get Proposer and Learner interfaces for node 0
+                proposer = paxosNode.getProposer(ringIdNumeric);
+                learner = paxosNode.getLearner();
+            }
+
+            // Step 3f: Followers wait for Node 0's acceptor znode to appear.
+            // This prevents a follower from transiently observing itself as min(acceptors)
+            // and starting a stale CoordinatorRole (ballot poisoning).
             if (nodeId != 0) {
                 awaitNodeZeroAcceptor();
             }
 
-            // Step 3c: Startup barrier — ALL nodes (including node 0) wait until every declared
-            // ring member has announced readiness via a ZooKeeper barrier znode. This ensures
-            // node 0's first Phase1 reservation (which starts inside paxosNode.start() via
-            // RingManager.notifyNewCoordinator) circulates a COMPLETE ring with all acceptors
-            // already registered. Without this, node 0 (registering first) becomes coordinator
-            // and begins reserving Phase1 instances (p1_preexecution_number=5000) against a
-            // 1- or 2-node ring; those poisoned instances are resent forever and return with
-            // quorum 0 even after followers join ("ring end without quorum (0)").
+            // Step 3g: ALL nodes wait at startup barrier until every declared ring member
+            // has announced readiness. This ensures that when followers start (registering
+            // their acceptors), they do so simultaneously, and node 0's first Phase1
+            // reservation (triggered by its CoordinatorRole) circulates a COMPLETE ring.
             awaitFullAcceptorMembership();
 
-            // Step 4: Create URingPaxos Node
-            log.info("[{}] Creating URingPaxos Node with ringID={}, zk={}", ringId, ringIdNumeric, zkConnect);
-            paxosNode = new Node(nodeId, zkConnect, rings);
+            // Step 3h: Followers now start (register their acceptors).
+            if (nodeId != 0) {
+                paxosNode = new Node(nodeId, zkConnect, rings);
+                paxosNode.start();
 
-            // Step 4: Start the node (this initializes all roles)
-            paxosNode.start();
-
-            // Step 5: Get Proposer and Learner interfaces
-            proposer = paxosNode.getProposer(ringIdNumeric);
-            learner = paxosNode.getLearner();
-
-            // Step 6: Start the last_acceptor heal kick in a background thread IMMEDIATELY
-            // after Node.start() returns. The CoordinatorRole starts inside paxosNode.start()
-            // (via RingManager.notifyNewCoordinator) and begins its Phase1 reservation loop
-            // (p1_preexecution_number=5000) right away. The heal kick must fire AS SOON AS
-            // all 3 acceptors are registered — BEFORE the coordinator's first Phase1 round
-            // completes — so followers' last_acceptor is correctly set to 2 (the ring-end).
-            // Running it in parallel with startDecisionListener() eliminates the ~2s delay
-            // that caused the heal to fire after the coordinator had already reserved thousands
-            // of instances.
-            if (nodeId == 0) {
-                Thread healThread = new Thread(() -> healLastAcceptorWatch(), "csmr-heal-last-acceptor-" + ringId);
-                healThread.setDaemon(true);
-                healThread.start();
-                log.info("[{}] Started last_acceptor heal kick in background thread", ringId);
+                // Get Proposer and Learner interfaces for followers
+                proposer = paxosNode.getProposer(ringIdNumeric);
+                learner = paxosNode.getLearner();
             }
 
-            // Step 7: Start decision listener in background
+            // Step 4: Fire SYNCHRONOUS last_acceptor heal kick on node 0.
+            // This must run BEFORE any Phase1 reservations complete, so followers'
+            // last_acceptor is correctly set to the true ring-end (max nodeId).
+            // The barrier above guarantees all acceptors are registered at this point.
+            if (nodeId == 0) {
+                healLastAcceptorWatchSync();
+            }
+
+            // Step 5: Start decision listener in background (all nodes)
             startDecisionListener();
 
             // Coordinator election is handled entirely by URingPaxos's own RingManager.
             //
-            // With the /ringpaxos/topology<N>/acceptors parent pre-created (zk-init), the
+            // With the /ringpaxos/topology<N>/acceptors parent pre-created, the
             // RingManager's acceptor-path watch is armed on the very first getConfig(), so when
-            // node 0's acceptor registers, RingManager.process() runs, computes
+            // node 0's acceptor registers (Step 3d), RingManager.process() runs, computes
             // coordinator = min(acceptors) = 0, sees the `old_coordinator != coordinator`
             // transition, and calls notifyNewCoordinator() — which STARTS the CoordinatorRole
-            // thread itself (RingManager.java:141-146). The Step 3b acceptor gate above keeps
+            // thread itself (RingManager.java:141-146). The Step 3f acceptor gate keeps
             // followers from registering before node 0, so node 0 is always the elected minimum
             // and no follower ever transiently self-elects.
             //
@@ -559,6 +557,126 @@ public class PaxosRingNode {
                 zk.create(path, null, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
             } catch (KeeperException.NodeExistsException ignored) {
                 // concurrent create by another node — fine
+            }
+        }
+    }
+
+    /**
+     * Ensures the URingPaxos acceptors parent znode exists.
+     * This arms the RingManager's watch on the acceptor path so that when
+     * node 0 registers its acceptor, the NodeChildrenChanged event fires
+     * and triggers coordinator election.
+     */
+    private void ensureAcceptorsParentExists() {
+        String topologyPath = RINGPAXOS_PREFIX + "/topology" + ringIdNumeric;
+        String acceptorsPath = topologyPath + "/acceptors";
+        ZooKeeper zk = null;
+        try {
+            CountDownLatch connected = new CountDownLatch(1);
+            zk = new ZooKeeper(zkConnect, 10000, event -> {
+                if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
+                    connected.countDown();
+                }
+            });
+            if (!connected.await(10000, TimeUnit.MILLISECONDS)) {
+                log.warn("[{}] Could not connect to ZK to ensure acceptors parent; proceeding.", ringId);
+                return;
+            }
+            ensureZnode(zk, RINGPAXOS_PREFIX);
+            ensureZnode(zk, topologyPath);
+            ensureZnode(zk, acceptorsPath);
+            log.debug("[{}] Ensured acceptors parent exists at {}", ringId, acceptorsPath);
+        } catch (Exception e) {
+            log.warn("[{}] Failed to ensure acceptors parent: {}", ringId, e.getMessage());
+        } finally {
+            if (zk != null) {
+                try { zk.close(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            }
+        }
+    }
+
+    /**
+     * Cleans up any stale ephemeral acceptor znode for this node from a prior run.
+     * Prevents distorted acceptor set on restart without volume wipe (e.g., Kubernetes
+     * pod restart without ZK volume wipe).
+     */
+    private void cleanupStaleAcceptorZnode() {
+        String acceptorPath = RINGPAXOS_PREFIX + "/topology" + ringIdNumeric + "/acceptors/" + nodeId;
+        ZooKeeper zk = null;
+        try {
+            CountDownLatch connected = new CountDownLatch(1);
+            zk = new ZooKeeper(zkConnect, 5000, event -> {
+                if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
+                    connected.countDown();
+                }
+            });
+            if (!connected.await(5000, TimeUnit.MILLISECONDS)) {
+                log.warn("[{}] Could not connect to ZK to cleanup stale acceptor znode; proceeding.", ringId);
+                return;
+            }
+            if (zk.exists(acceptorPath, false) != null) {
+                zk.delete(acceptorPath, -1);
+                log.info("[{}] Cleaned up stale acceptor znode: {}", ringId, acceptorPath);
+            }
+        } catch (Exception e) {
+            log.debug("[{}] No stale acceptor znode to clean (or error): {}", ringId, e.getMessage());
+        } finally {
+            if (zk != null) {
+                try { zk.close(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            }
+        }
+    }
+
+    /**
+     * SYNCHRONOUS version of last_acceptor heal kick.
+     * Fires immediately after all acceptors are confirmed registered, BEFORE
+     * any Phase1 reservations can complete. This ensures followers' last_acceptor
+     * is correctly set to the true ring-end (max nodeId).
+     */
+    private void healLastAcceptorWatchSync() {
+        String acceptorsPath = RINGPAXOS_PREFIX + "/topology" + ringIdNumeric + "/acceptors";
+        String kickPath = acceptorsPath + "/" + HEAL_KICK_CHILD;
+        int expected = ringMembers.size();
+        ZooKeeper zk = null;
+        try {
+            CountDownLatch connected = new CountDownLatch(1);
+            zk = new ZooKeeper(zkConnect, 10000, event -> {
+                if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
+                    connected.countDown();
+                }
+            });
+            if (!connected.await(10000, TimeUnit.MILLISECONDS)) {
+                log.warn("[{}] Could not connect to ZK for sync heal kick; skipping.", ringId);
+                return;
+            }
+
+            // Wait for all acceptors (already done in barrier, but double-check)
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (System.currentTimeMillis() < deadline) {
+                if (countIntegerChildren(zk, acceptorsPath) >= expected) break;
+                Thread.sleep(100);
+            }
+
+            // Fire the kick: create then delete a transient integer-named child.
+            // This produces two NodeChildrenChanged events, forcing RingManager.process()
+            // to recompute last_acceptor = max(acceptor IDs) on every node.
+            try {
+                zk.create(kickPath, null, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            } catch (KeeperException.NodeExistsException e) {
+                // Stale kick child from a prior run; delete and recreate to still produce two events.
+                zk.delete(kickPath, -1);
+                zk.create(kickPath, null, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+            }
+            zk.delete(kickPath, -1);
+            log.info("[{}] SYNCHRONOUS last_acceptor heal kick fired (created+deleted {}).", ringId, kickPath);
+
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            log.warn("[{}] Sync heal kick failed: {}; ring may not reach quorum.", ringId, e.getMessage());
+        } finally {
+            if (zk != null) {
+                try { zk.close(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
             }
         }
     }
