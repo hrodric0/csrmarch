@@ -381,6 +381,129 @@ services:
       retries: 20
       start_period: 30s
 
+  # ── Scenario 1 (Addition) Lock Service Ring: 3 replicas (app + sidecar each) ──
+  lock-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-lockservice
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-lock-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "lock_service"
+      RING_ID_NUMERIC: "7"
+      RING_SIZE: "3"
+      NODE_ID: "0"
+      APP_PORT: "8081"
+      APP_HOST: "lock-0"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19060:9000"
+    expose:
+      - "9000"
+    # Node 0 registers its acceptor znode FIRST; single in-sidecar coordinator — see sidecar-kvs-0.
+    depends_on:
+      lock-0:
+        condition: service_started
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  lock-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-lockservice
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-lock-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "lock_service"
+      RING_ID_NUMERIC: "7"
+      RING_SIZE: "3"
+      NODE_ID: "1"
+      APP_PORT: "8081"
+      APP_HOST: "lock-1"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19061:9000"
+    expose:
+      - "9000"
+    depends_on:
+      lock-1:
+        condition: service_started
+      sidecar-lock-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  lock-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-lockservice
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-lock-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "lock_service"
+      RING_ID_NUMERIC: "7"
+      RING_SIZE: "3"
+      NODE_ID: "2"
+      APP_PORT: "8081"
+      APP_HOST: "lock-2"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19062:9000"
+    expose:
+      - "9000"
+    depends_on:
+      lock-2:
+        condition: service_started
+      sidecar-lock-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
   # ── Scenario 3 (Argument Partition) Ring 1: kv_store_ring1 (topology3) ────────
   kvs-ring1-0:
     build:

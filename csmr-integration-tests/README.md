@@ -17,6 +17,7 @@ stack).
 | `SystemHealthTest` | Docker / ZooKeeper topology health |
 | `AuditLoggingTest` | Transparent audit via `f(D)` |
 | `PerformanceBenchmarkTest` | Latency / throughput benchmark with warmup + p50/p95/p99 percentiles |
+| `AdditionTest` | Scenario 1: `acquire` / `release` Lock Service routed to its own `lock_service` ring, composed without touching `kv_store` |
 | `PartitionTest` | Scenario 3: `partitioned_put` key-range sharding (`kv_store_ring1` a-m / `kv_store_ring2` n-z) |
 | `DeprecationTest` | Scenario 4: deprecated `sign_rsa` rejected with removal reason |
 | `ChainingTest` | Chaining PoC 2: `init_counter` → PRNG.Generate → Counter.SetValue |
@@ -31,6 +32,10 @@ csmr-integration-tests/
     ├── BasicOperationsTest.java
     ├── CompositionTest.java
     ├── LoggerOperationsTest.java
+    ├── AdditionTest.java
+    ├── PartitionTest.java
+    ├── DeprecationTest.java
+    ├── ChainingTest.java
     ├── ConcurrencyTest.java
     ├── FailureScenariosTest.java
     ├── SystemHealthTest.java

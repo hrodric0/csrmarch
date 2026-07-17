@@ -72,14 +72,55 @@ public class CsmrProxyClient {
         }
     }
 
+    /**
+     * Sends a raw JSON payload and returns the HTTP status code. The body can then be
+     * read separately when the test must assert on status (e.g. deprecation returns 500).
+     */
+    public int sendCommandStatusCode(String jsonPayload) throws IOException {
+        HttpPost request = new HttpPost(proxyUrl + "/api/command");
+        request.setEntity(new StringEntity(jsonPayload, ContentType.APPLICATION_JSON));
+
+        try (var response = httpClient.execute(request)) {
+            return response.getCode();
+        }
+    }
+
+    /**
+     * Returns true only when the proxy reports a real decided consensus envelope.
+     *
+     * The proxy success envelope is {@code {"id":N,"result":"<stringified sidecar JSON>"}}
+     * where the inner stringified JSON carries {@code sidecar_response.status":"decided"}.
+     * We therefore accept either:
+     *   - a top-level {@code "result"} field that wraps a decided sidecar payload, OR
+     *   - a literal decided marker anywhere in the body (e.g. when the body was not double-
+     *     encoded). A bare {@code "result"} key is NOT sufficient on its own because the
+     *     proxy also uses {@code "result"} for error/shaping wrappers; callers should assert
+     *     {@link #hasDecidedSidecar(String)} to pin down the math (status == decided + quorum).
+     */
     public boolean isDecided(String response) {
-        return response != null && response.contains("\"status\":\"decided\"")
+        if (response == null || response.isBlank()) {
+            return false;
+        }
+        // The sidecar envelope arrives inside "result" as a STRINGIFIED (escaped) JSON, so the
+        // decided marker appears as \"status\":\"decided\" (backslash-quoted) on the wire. We
+        // require the decided status marker in its raw or escaped form; a bare "result" with no
+        // decided sidecar (e.g. an error wrapper) must NOT pass as decided.
+        return response.contains("\"status\":\"decided\"")
             || response.contains("\"status\": \"decided\"")
-            || response.contains("\"result\"");
+            || response.contains("\\\"status\\\":\\\"decided\\\"")
+            || response.contains("\\\"status\\\": \\\"decided\\\"");
     }
 
     public boolean hasResult(String response) {
         return response != null && response.contains("\"result\"");
+    }
+
+    /**
+     * Strict check used by tests that must prove an SMR command was actually ordered
+     * (status == decided) rather than merely shaped. Rejects empty/error bodies.
+     */
+    public boolean hasDecidedSidecar(String response) {
+        return isDecided(response);
     }
 
     public CompletableFuture<String> sendCommandAsync(String method, Map<String, Object> params) {

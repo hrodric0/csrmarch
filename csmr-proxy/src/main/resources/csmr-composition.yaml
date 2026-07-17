@@ -4,9 +4,14 @@
 # This is a local development version of the CSMR composition that uses
 # Docker Compose service names instead of Kubernetes DNS names.
 #
-# Service addresses map to the sidecar containers in docker-compose.yml:
-#   - kvs-*: KeyValueStore app with Paxos sidecar on port 8081
-#   - log-*: LogService app with Paxos sidecar on port 8082
+# Service addresses map to the sidecar containers in docker-compose.yml.
+# This single manifest is the authority for ALL dissertation scenarios so the
+# default (always-up) proxy serves every E2E test without a YAML repoint:
+#   - Scenario 1 (Addition):       lock_service (ExposeLockAcquire/Release)
+#   - Scenario 2 (Composition):    kv_store + logger (PutWithLogging/GetAudited)
+#   - Scenario 3 (Partition):      kv_store_ring1 / kv_store_ring2 (PartitionedKVS)
+#   - Scenario 4 (Deprecation):    sign_rsa (deprecated: true, blocked at router)
+#   - PoC 2 (Chaining SMRs):       prng_service -> counter_service (InitCounter)
 # =============================================================================
 apiVersion: csmr.ufsc.br/v1alpha1
 kind: CsmrComposition
@@ -66,14 +71,119 @@ spec:
               type: int
           returns: bool
 
+    # Scenario 3 (Argument Partition) — two independent shard rings.
+    kv_store_ring1:
+      addresses:
+        - "sidecar-kvs-ring1-0:9000"
+        - "sidecar-kvs-ring1-1:9000"
+        - "sidecar-kvs-ring1-2:9000"
+      operations:
+        - method: "Put"
+          params:
+            - name: key
+              type: string
+            - name: value
+              type: string
+          returns: void
+        - method: "Get"
+          params:
+            - name: key
+              type: string
+          returns: string
+
+    kv_store_ring2:
+      addresses:
+        - "sidecar-kvs-ring2-0:9000"
+        - "sidecar-kvs-ring2-1:9000"
+        - "sidecar-kvs-ring2-2:9000"
+      operations:
+        - method: "Put"
+          params:
+            - name: key
+              type: string
+            - name: value
+              type: string
+          returns: void
+        - method: "Get"
+          params:
+            - name: key
+              type: string
+          returns: string
+
+    # Scenario 1 (Addition) — Lock Service SMR, composed without touching kv_store.
+    lock_service:
+      addresses:
+        - "sidecar-lock-0:9000"
+        - "sidecar-lock-1:9000"
+        - "sidecar-lock-2:9000"
+      operations:
+        - method: "Acquire"
+          params:
+            - name: lockName
+              type: string
+            - name: timeout
+              type: int
+          returns: bool
+        - method: "Release"
+          params:
+            - name: lockName
+              type: string
+          returns: bool
+
+    # PoC 2 (Chaining) — PRNG and Counter SMRs.
+    prng_service:
+      addresses:
+        - "sidecar-prng-0:9000"
+        - "sidecar-prng-1:9000"
+        - "sidecar-prng-2:9000"
+      operations:
+        - method: "Generate"
+          params:
+            - name: min
+              type: int
+            - name: max
+              type: int
+          returns: int
+
+    counter_service:
+      addresses:
+        - "sidecar-counter-0:9000"
+        - "sidecar-counter-1:9000"
+        - "sidecar-counter-2:9000"
+      operations:
+        - method: "SetValue"
+          params:
+            - name: value
+              type: int
+          returns: int
+        - method: "GetValue"
+          params: []
+          returns: int
+        - method: "Increment"
+          params: []
+          returns: int
+
   # ── Composition rules ──────────────────────────────────────────────────────
   compositions:
 
+    # Scenario 1 (Addition): expose the KVS get as a clean pass-through.
     - name: "ExposeGet"
       type: "Addition"
       method: "Get"
       service_operation: "kv_store.Get"
 
+    # Scenario 1 (Addition): expose Lock Service without modifying kv_store.
+    - name: "ExposeLockAcquire"
+      type: "Addition"
+      method: "Acquire"
+      service_operation: "lock_service.Acquire"
+
+    - name: "ExposeLockRelease"
+      type: "Addition"
+      method: "Release"
+      service_operation: "lock_service.Release"
+
+    # Scenario 2 (Composition): active duplication to kv_store + logger, f(D) keeps KVS payload.
     - name: "PutWithLogging"
       type: "Composition"
       method: "Put"
@@ -107,3 +217,61 @@ spec:
         - target_service: "logger"
           target_method: "Append"
           entry_format: "get({key})"
+
+    # Scenario 3 (Partition / Sharding): route by key range into independent rings.
+    - name: "PartitionedKVS"
+      type: "Partition"
+      method: "partitioned_put"
+      params:
+        - name: key
+          type: string
+        - name: value
+          type: string
+      returns: void
+      partition_by: "key"
+      partition_rules:
+        - when: "key_range"
+          key_range: "a-m"
+          target_service: "kv_store_ring1"
+          target_method: "Put"
+        - when: "key_range"
+          key_range: "n-z"
+          target_service: "kv_store_ring2"
+          target_method: "Put"
+
+    # Scenario 4 (Deprecation): removed operation blocked at the routing layer.
+    - name: "RemoveRSA"
+      type: "Composition"
+      method: "sign_rsa"
+      deprecated: true
+      removal_reason: "RSA-2048 signing removed: superseded by ed25519 (CVE-2025-0042)"
+      params:
+        - name: message
+          type: string
+      returns: string
+      routing:
+        - target_service: "crypto_service"
+          target_method: "Sign"
+
+    # PoC 2 (Chaining SMRs): PRNG -> Counter automated feedback loop.
+    - name: "InitCounterWithRandom"
+      type: "Chaining"
+      method: "init_counter"
+      params:
+        - name: min
+          type: int
+        - name: max
+          type: int
+      returns: int
+      return_intermediate: true
+      chaining_stages:
+        - stage_order: 1
+          target_service: "prng_service"
+          target_method: "Generate"
+          output_field: "result"
+          input_mapper: "PrngInputMapper"
+        - stage_order: 2
+          target_service: "counter_service"
+          target_method: "SetValue"
+          output_field: "result"
+          input_mapper: "CounterValueMapper"

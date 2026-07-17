@@ -55,7 +55,7 @@ public class CsmrDockerComposeExtension implements BeforeAllCallback, AfterAllCa
 
     private void verifyStackRunning() {
         try {
-            Process checkProcess = new ProcessBuilder("docker", "compose", "-p", COMPOSE_PROJECT_NAME, "ps", "--services", "--filter", "status=running")
+            Process checkProcess = new ProcessBuilder("docker", "compose", "ps", "--services", "--filter", "status=running")
                 .directory(new File(COMPOSE_PROJECT_DIR))
                 .start();
             checkProcess.waitFor(10, TimeUnit.SECONDS);

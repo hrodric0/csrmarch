@@ -110,14 +110,26 @@ class CompositionTest {
             "value", "filter_test_value"
         ));
 
-        assertTrue(client.hasResult(response) || client.isDecided(response),
-            "Should achieve consensus. Response: " + response);
+        assertTrue(client.isDecided(response),
+            "PutWithLogging must be decided (f+1 quorum). Response: " + response);
 
-        // Verify the response does NOT contain Logger's Append acknowledgment
-        // The f(D) = KvsOutputFunction should filter out logger group responses
-        assertFalse(response.toLowerCase().contains("logger"),
-            "Logger response should be filtered out by f(D). Response: " + response);
-        assertFalse(response.toLowerCase().contains("append"),
-            "Logger Append acknowledgment should not leak to client. Response: " + response);
+        // Parse the decided sidecar envelope and assert f(D) selected the KVS group,
+        // NOT the logger group. This proves horizontal composition (R = R1 ∪ R2) while
+        // the client observes only the KVS result.
+        com.fasterxml.jackson.databind.JsonNode root =
+            new com.fasterxml.jackson.databind.ObjectMapper().readTree(response);
+        com.fasterxml.jackson.databind.JsonNode resultNode = root.get("result");
+        String innerJson = resultNode.isTextual() ? resultNode.asText() : resultNode.toString();
+        com.fasterxml.jackson.databind.JsonNode inner =
+            new com.fasterxml.jackson.databind.ObjectMapper().readTree(innerJson);
+        String ring = inner.path("sidecar_response").path("ring").asText();
+
+        assertEquals("kv_store_Put", ring,
+            "f(D)=KvsOutputFunction must select the KVS group; logger ack must be discarded. Body: " + response);
+        assertFalse("logger".equals(ring) || ring.contains("log"),
+            "Logger response must be filtered out by f(D). Body: " + response);
+        // Belt-and-suspenders: the selected payload must bear the written value.
+        assertTrue(response.contains("filter_test_value"),
+            "KVS payload should carry the written value. Body: " + response);
     }
 }

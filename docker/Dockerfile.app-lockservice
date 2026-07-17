@@ -1,20 +1,6 @@
 # =============================================================================
 # Dockerfile — csmr-app-lockservice (Lock Service, Scenario 1)
 # =============================================================================
-
-FROM eclipse-temurin:17-jdk-alpine AS builder
-
-WORKDIR /build
-
-COPY pom.xml .
-COPY csmr-execution-layer/csmr-app-lockservice/pom.xml csmr-execution-layer/csmr-app-lockservice/pom.xml
-
-RUN apk add --no-cache maven && \
-    mvn dependency:go-offline -pl csmr-execution-layer/csmr-app-lockservice -am --no-transfer-progress
-
-COPY csmr-execution-layer/csmr-app-lockservice/src csmr-execution-layer/csmr-app-lockservice/src
-RUN mvn package -pl csmr-execution-layer/csmr-app-lockservice -am -DskipTests --no-transfer-progress
-
 FROM eclipse-temurin:17-jre-alpine
 
 LABEL description="CSMR Lock Service — distributed acquire/release operations (Scenario 1, Adding Operations)"
@@ -23,10 +9,11 @@ RUN addgroup -S csmr && adduser -S csmr -G csmr
 USER csmr
 WORKDIR /app
 
-COPY --from=builder \
-  /build/csmr-execution-layer/csmr-app-lockservice/target/csmr-app-lockservice-*.jar app.jar
+COPY csmr-execution-layer/csmr-app-lockservice/target/csmr-app-lockservice-*.jar app.jar
 
-EXPOSE 8083
+EXPOSE 8081
+
+ENV SERVER_PORT=8081
 
 ENTRYPOINT ["java", \
   "-Xms128m", "-Xmx512m", \

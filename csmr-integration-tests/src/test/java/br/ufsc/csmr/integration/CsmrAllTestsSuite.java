@@ -19,12 +19,15 @@ import org.junit.platform.suite.api.*;
     BasicOperationsTest.class,
     CompositionTest.class,
     LoggerOperationsTest.class,
+    AdditionTest.class,
+    PartitionTest.class,
+    DeprecationTest.class,
+    ChainingTest.class,
     ConcurrencyTest.class,
     FailureScenariosTest.class,
     SystemHealthTest.class,
     AuditLoggingTest.class
 })
-@IncludeTags("integration")
 public class CsmrAllTestsSuite {
     // This class remains empty - it's just a suite definition
 }

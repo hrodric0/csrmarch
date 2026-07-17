@@ -14,27 +14,34 @@ import org.junit.platform.suite.api.*;
  * Equivalent to running `./test-csmr-comprehensive.sh all`
  *
  * Test order:
- * 1. BasicOperationsTest - Basic KVS operations (GET/PUT)
- * 2. CompositionTest - Scenario 2: Active duplication + f(D) filtering
- * 3. LoggerOperationsTest - Logger service operations via composition
- * 4. ConcurrencyTest - Concurrent operations (10 parallel PUTs/GETs)
- * 5. FailureScenariosTest - Replica failure and recovery
- * 6. SystemHealthTest - System health verification
- * 7. AuditLoggingTest - Transparent audit logging verification
- * 8. PerformanceBenchmarkTest - Latency and throughput benchmarks
+ * 1. BasicOperationsTest   - Basic KVS operations (GET/PUT)
+ * 2. CompositionTest       - Scenario 2: Active duplication + f(D) filtering
+ * 3. LoggerOperationsTest  - Logger service operations via composition
+ * 4. AdditionTest          - Scenario 1: Adding SMR Operations (Lock Service)
+ * 5. PartitionTest         - Scenario 3: Argument Partition (Sharding)
+ * 6. DeprecationTest       - Scenario 4: Removing Operations (Deprecation)
+ * 7. ChainingTest          - PoC 2: Chaining SMRs (PRNG -> Counter)
+ * 8. ConcurrencyTest       - Concurrent operations (10 parallel PUTs/GETs)
+ * 9. FailureScenariosTest  - Replica failure and recovery
+ * 10. SystemHealthTest     - System health verification
+ * 11. AuditLoggingTest     - Transparent audit logging verification
+ * 12. PerformanceBenchmarkTest - Latency and throughput benchmarks
  */
 @Suite
 @SelectClasses({
     BasicOperationsTest.class,
     CompositionTest.class,
     LoggerOperationsTest.class,
+    AdditionTest.class,
+    PartitionTest.class,
+    DeprecationTest.class,
+    ChainingTest.class,
     ConcurrencyTest.class,
     FailureScenariosTest.class,
     SystemHealthTest.class,
     AuditLoggingTest.class,
     PerformanceBenchmarkTest.class
 })
-@IncludeTags("integration")
 public class CsmrIntegrationTestSuite {
     // Test suite - no additional code needed
 }
