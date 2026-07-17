@@ -4,6 +4,9 @@ Proof-of-Concept implementation of the **CSMR** formal model (Alves, 2026)
 using the **U-Ring Paxos** consensus engine (Benz, 2013) in a cloud-native
 Kubernetes architecture (Bonatto, 2026).
 
+**Author:** Rodrigo W. Bonatto — Universidade Federal de Santa Catarina (UFSC, 2026).
+**Source:** https://github.com/hrodric0/csmrarch
+
 ---
 
 ## Documentation Index
@@ -17,11 +20,11 @@ Kubernetes architecture (Bonatto, 2026).
 | [csmr-execution-layer/csmr-app-log/README.md](csmr-execution-layer/csmr-app-log/README.md) | Logging Service (SMR 3) |
 | [csmr-execution-layer/csmr-app-lockservice/README.md](csmr-execution-layer/csmr-app-lockservice/README.md) | Lock Service (Scenario 1) |
 | [csmr-execution-layer/csmr-sidecar-paxos/README.md](csmr-execution-layer/csmr-sidecar-paxos/README.md) | Paxos Sidecar + URingPaxos integration |
-| [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md) | Full implementation details |
-| [ENGINEERING_CONSTRAINTS.md](ENGINEERING_CONSTRAINTS.md) | Low-level engineering constraints |
-| [ADVANCED_THEORETICAL_CONSTRAINTS.md](ADVANCED_THEORETICAL_CONSTRAINTS.md) | Advanced validations + ChainingSMRs |
-| [URINGPAXOS_CONFIG.md](URINGPAXOS_CONFIG.md) | URingPaxos configuration guide |
-| [test-csmr-comprehensive.sh](test-scripts/test-csmr-comprehensive.sh) | Comprehensive test suite |
+| [csmr-execution-layer/csmr-app-prng/README.md](csmr-execution-layer/csmr-app-prng/README.md) | PRNG Service (Chaining PoC 2) |
+| [csmr-execution-layer/csmr-app-counter/README.md](csmr-execution-layer/csmr-app-counter/README.md) | Counter Service (Chaining PoC 2) |
+| [csmr-integration-tests/README.md](csmr-integration-tests/README.md) | JUnit 5 + Testcontainers integration suite |
+| [test-csmr-comprehensive.sh](test-scripts/test-csmr-comprehensive.sh) | Comprehensive bash test suite (Scenarios 1–4 + partition/deprecation) |
+| [test-chaining.sh](test-scripts/test-chaining.sh) | Chaining PoC 2 E2E test (PRNG → Counter) |
 
 ---
 
@@ -67,7 +70,7 @@ Client
 ## Module Structure
 
 ```
-csmr-project/
+csmrarch/
 ├── pom.xml                          # Maven multi-module root
 ├── docker-compose.yml               # Local dev stack (no K8s)
 │
@@ -94,10 +97,11 @@ csmr-project/
 │   ├── csmr-app-kvs/                # SMR 2 — Key-Value Store
 │   ├── csmr-app-log/                # SMR 3 — Logging Service
 │   ├── csmr-app-lockservice/        # Lock Service (Scenario 1)
+│   ├── csmr-app-prng/               # PRNG Service (Chaining PoC 2)
+│   ├── csmr-app-counter/            # Counter Service (Chaining PoC 2)
 │   └── csmr-sidecar-paxos/          # URingPaxos sidecar wrapper
 │       └── src/.../sidecar/
-│           ├── paxos/PaxosRingNode.java      ← TCP Unicast ring
-│           ├── paxos/MultiLearnerRole.java   ← Skip! mechanism
+│           ├── paxos/PaxosRingNode.java      ← Multi-Ring Paxos participant
 │           ├── storage/StableStorageFactory.java ← 3 storage backends
 │           └── zk/ZooKeeperRingDiscovery.java
 │
@@ -106,6 +110,9 @@ csmr-project/
 │   ├── full-csmr-composition.yaml   ← All 4 scenarios
 │   ├── chaining-smr-composition.yaml ← PoC 2: ChainingSMRs
 │   └── crd-csmrcomposition.yaml     ← Kubernetes CRD definition
+│
+├── csmr-integration-tests/          # JUnit 5 + Testcontainers suite
+│   └── src/test/java/br/ufsc/csmr/integration/*.java
 │
 ├── infra/                           # Terraform
 │   ├── main.tf
@@ -119,6 +126,8 @@ csmr-project/
     ├── Dockerfile.app-kvs
     ├── Dockerfile.app-log
     ├── Dockerfile.app-lockservice
+    ├── Dockerfile.app-prng
+    ├── Dockerfile.app-counter
     └── Dockerfile.sidecar-paxos
 ```
 
@@ -162,6 +171,8 @@ docker build -f docker/Dockerfile.proxy                  -t localhost:5000/csmr-
 docker build -f docker/Dockerfile.app-kvs                -t localhost:5000/csmr-app-kvs:latest .
 docker build -f docker/Dockerfile.app-log                -t localhost:5000/csmr-app-log:latest .
 docker build -f docker/Dockerfile.app-lockservice        -t localhost:5000/csmr-app-lockservice:latest .
+docker build -f docker/Dockerfile.app-prng            -t localhost:5000/csmr-app-prng:latest .
+docker build -f docker/Dockerfile.app-counter          -t localhost:5000/csmr-app-counter:latest .
 docker build -f docker/Dockerfile.sidecar-paxos        -t localhost:5000/csmr-sidecar-paxos:latest .
 
 # 4. Provision with Terraform (HA proxy by default)
@@ -439,21 +450,6 @@ int requiredResponses = DEFAULT_F + 1;
 
 ---
 
-## Integrating URingPaxos
-
-The `csmr-sidecar-paxos` module contains stub code marked with `TODO`. To integrate the real library:
-
-```bash
-git clone https://github.com/sambenz/URingPaxos
-cd URingPaxos && mvn install
-```
-
-Then uncomment the dependency in `csmr-sidecar-paxos/pom.xml` and replace stubs in:
-- `PaxosRingNode.java` (lines 104-109, 140, 144)
-- `StableStorageFactory.java` (lines 42-50, 64-74, 87-96)
-
----
-
 ## Cloud Deployment
 
 ### AWS EKS
@@ -520,7 +516,7 @@ az aks create --resource-group csmr-rg --name csmr-cluster \
 # 2. Configure kubectl
 az aks get-credentials --resource-group csmr-rg --name csmr-cluster
 
-# 3. Build and push to ACR (for each service)
+# 3. Build and push to ACR (incl. new PRNG/Counter chaining services)
 az acr create --resource-group csmr-rg --name csmracr --sku Basic
 az acr login --name csmracr
 docker build -f docker/Dockerfile.control-plane -t csmracr.azurecr.io/csmr-control-plane:latest .
@@ -579,9 +575,26 @@ aws ecr create-repository --repository-name csmr-test \
 | **Logger Operations** | 1 | Verify audit logging |
 | **Concurrency** | 3 | 10 concurrent PUTs/GETs, verify linearizability |
 | **Failure Scenarios** | 4 | Replica stop/start, verify f+1 tolerance |
+| **Partition (Scenario 3)** | - | `partitioned_put` routes by key range to `kv_store_ring1` (a-m) / `kv_store_ring2` (n-z) |
+| **Deprecation (Scenario 4)** | - | `sign_rsa` returns 500 with removal reason via YAML `deprecated` flag |
 | **System Health** | 2 | Docker status, ZooKeeper topology |
 | **Audit Logging** | 3 | Transparent audit via f(D) |
+| **Chaining (PoC 2)** | - | `init_counter` → PRNG.Generate → Counter.SetValue |
 | **Performance** | - | Latency (36ms PUT, 38ms GET), Throughput (35 req/s) |
+
+> **Note:** The default composition is `classpath:csmr-composition.yaml`. Set the
+> `CSMR_ROUTING_YAML_PATH` env var (or `-Dcsmr.routing.yaml-path=`) to point the
+> proxy at `full-csmr-composition.yaml` / `chaining-smr-composition.yaml`. An empty
+> value falls back to the classpath default. See `csmr-proxy/README.md`.
+
+### JUnit Integration Suite
+
+The `csmr-integration-tests` module runs JUnit 5 + Testcontainers scenarios
+(composition validations, quorum behavior, and chaining) outside the bash harness.
+
+```bash
+mvn test -pl csmr-integration-tests
+```
 
 ### Run Tests in CI/CD
 
@@ -592,18 +605,6 @@ aws ecr create-repository --repository-name csmr-test \
     mvn clean package -DskipTests
     docker compose up -d
     ./test-csmr-comprehensive.sh all
-```
-
----
-
-```bash
-# Build all modules
-mvn clean package -DskipTests
-
-# Build single module
-mvn clean package -DskipTests -pl csmr-control-plane
-mvn clean package -DskipTests -pl csmr-proxy
-mvn clean package -DskipTests -pl csmr-execution-layer/csmr-app-kvs
 ```
 
 ---
@@ -628,13 +629,15 @@ mvn clean package -DskipTests -pl csmr-execution-layer/csmr-app-kvs
 - Alves, C. M. (2026). *Extending State Machine Replication through Composition*. UFSC.
 - Bonatto, R. W. (2026). *Proposta de Implementação CSMR com Multi-Ring Paxos*. UFSC.
 - Benz, S. (2013). *URingPaxos*. https://github.com/sambenz/URingPaxos
+- Bonatto, R. W. CSMR — Composing State Machine Replication with Multi-Ring Paxos. UFSC. https://github.com/hrodric0/csmrarch
 
 ---
 
-## Documentation Files
+## Author
 
-| File | Description |
-|------|-------------|
-| `IMPLEMENTATION_SUMMARY.md` | Full implementation details |
-| `ENGINEERING_CONSTRAINTS.md` | Low-level engineering constraints |
-| `ADVANCED_THEORETICAL_CONSTRAINTS.md` | Advanced validations + ChainingSMRs |
+**Rodrigo W. Bonatto** — Universidade Federal de Santa Catarina (UFSC, 2026).
+
+This work is part of the CSMR (Composing State Machine Replication) proof-of-concept.
+
+- Project: [CSMR — Composing State Machine Replication with Multi-Ring Paxos](https://github.com/hrodric0/csmrarch)
+- Source: https://github.com/hrodric0/csmrarch

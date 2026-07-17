@@ -1,129 +1,89 @@
 # CSMR Integration Tests
 
-JUnit 5 + Testcontainers integration test suite based on the `test-csmr.sh` and `test-csmr-comprehensive.sh` bash scripts.
+JUnit 5 + Testcontainers integration suite for the CSMR PoC. These tests
+exercise the proxy, control-plane checker, and SMR apps end-to-end against a
+running stack (Testcontainers-managed sidecars/apps or a live `docker compose`
+stack).
 
-## Test Coverage
+## Overview
 
-These tests mirror all 8 scenarios from the comprehensive test script:
+| Test Class | What it covers |
+|------------|----------------|
+| `BasicOperationsTest` | KVS PUT/GET, read-after-write, missing key |
+| `CompositionTest` | Scenario 2: active duplication (KVS + Logger) with `f(D)` filtering |
+| `LoggerOperationsTest` | Logger append/retrieve |
+| `ConcurrencyTest` | Concurrent PUT/GET, linearizability |
+| `FailureScenariosTest` | `f+1` fault tolerance (replica stop/start) |
+| `SystemHealthTest` | Docker / ZooKeeper topology health |
+| `AuditLoggingTest` | Transparent audit via `f(D)` |
+| `PerformanceBenchmarkTest` | Latency / throughput benchmark |
+| `PartitionTest` | Scenario 3: `partitioned_put` key-range sharding (`kv_store_ring1` a-m / `kv_store_ring2` n-z) |
+| `DeprecationTest` | Scenario 4: deprecated `sign_rsa` rejected with removal reason |
+| `ChainingTest` | Chaining PoC 2: `init_counter` → PRNG.Generate → Counter.SetValue |
 
-| Test Class | Script Function | Description |
-|------------|----------------|-------------|
-| `BasicOperationsTest` | `test_basic_operations()` | Basic KVS GET/PUT with linearizability |
-| `CompositionTest` | `test_composition()` | Scenario 2: Active duplication + f(D) filtering |
-| `LoggerOperationsTest` | `test_logger_operations()` | Logger ring operations via composition |
-| `ConcurrencyTest` | `test_concurrency()` | 10 concurrent PUTs/GETs |
-| `FailureScenariosTest` | `test_failure_scenarios()` | Replica failure tolerance (f=1) |
-| `SystemHealthTest` | `test_system_health()` | System health and URingPaxos integration |
-| `AuditLoggingTest` | `test_audit_logging()` | Transparent audit logging via f(D) |
-| `PerformanceBenchmarkTest` | `run_performance_benchmark()` | Latency and throughput benchmarks |
-
-## Architecture
+## Folder Structure
 
 ```
 csmr-integration-tests/
-├── pom.xml                                    # Maven config with Testcontainers
-├── src/test/java/br/ufsc/csmr/integration/
-│   ├── CsmrDockerComposeExtension.java       # JUnit 5 extension managing Docker Compose
-│   ├── CsmrProxyClient.java                  # HTTP client for proxy commands
-│   ├── CsmrIntegrationTestSuite.java         # Main test suite
-│   ├── BasicOperationsTest.java              # Scenario 1
-│   ├── CompositionTest.java                  # Scenario 2
-│   ├── LoggerOperationsTest.java             # Scenario 3
-│   ├── ConcurrencyTest.java                  # Scenario 4
-│   ├── FailureScenariosTest.java             # Scenario 5
-│   ├── SystemHealthTest.java                 # Scenario 6
-│   ├── AuditLoggingTest.java                 # Scenario 7
-│   └── PerformanceBenchmarkTest.java         # Scenario 8
+├── pom.xml
+├── Dockerfile.integration-tests
+└── src/test/java/br/ufsc/csmr/integration/
+    ├── BasicOperationsTest.java
+    ├── CompositionTest.java
+    ├── LoggerOperationsTest.java
+    ├── ConcurrencyTest.java
+    ├── FailureScenariosTest.java
+    ├── SystemHealthTest.java
+    ├── AuditLoggingTest.java
+    └── PerformanceBenchmarkTest.java
 ```
 
-## Prerequisites
+## Compilation & Run
 
-- Java 17+
-- Maven 3.8+
-- Docker running locally
-- The main project built: `mvn clean package -DskipTests` (from project root)
-
-## Running Tests
-
-### Run all integration tests
 ```bash
-cd csmr-integration-tests
-mvn verify
+# From the repo root (module inherits from the parent pom)
+cd <repo-root>
+mvn clean test -pl csmr-integration-tests
+
+# Run a single test class
+mvn test -pl csmr-integration-tests -Dtest=ChainingTest
+
+# Run against a live docker-compose stack
+docker compose up -d --build
+mvn test -pl csmr-integration-tests
 ```
 
-### Run specific test class
-```bash
-mvn verify -Dtest=BasicOperationsTest
-mvn verify -Dtest=CompositionTest
-mvn verify -Dtest=ConcurrencyTest
-```
+> Prerequisite: the `ch.usi.da:paxos:trunk` (URingPaxos) artifact must be
+> installed into your local `~/.m2` (see root `README.md`).
 
-### Run with verbose output
-```bash
-mvn verify -Dsurefire.useFile=false
-```
+## Scenario Coverage
 
-## Key Features
+The suite mirrors the dissertation's four scenarios plus the Chaining PoC 2:
 
-### 1. Readiness Probing (No Fixed Sleeps)
-The `CsmrDockerComposeExtension.proxyReady()` method implements the same readiness gate as `probe_proxy_ready()` in the bash scripts:
-- Polls the proxy with a dedicated probe command
-- Waits until a real PUT achieves consensus (`"result"` or `"status":"decided"`)
-- Timeout: 180 seconds, poll interval: 3 seconds
+- **Scenario 1 – Adding SMR Operations**: Lock Service exercised via composition.
+- **Scenario 2 – Extending Operations' Execution**: active duplication to multiple
+  rings with an InputMapper + `f(D)` output function.
+- **Scenario 3 – Argument Partition (Sharding)**: routes by operation arguments
+  (key range) into independent rings.
+- **Scenario 4 – Removing Operations**: dynamic exclusion via the YAML
+  `deprecated` flag (returns 500 with the removal reason).
+- **Chaining SMRs (PoC 2)**: output of one SMR operation becomes the input to
+  another (PRNG → Counter).
 
-### 2. Active Duplication Verification
-`CompositionTest` and `AuditLoggingTest` verify:
-- PUT/GET commands are actively duplicated to both KVS and Logger rings
-- The `KvsOutputFunction` (f(D)) filters out Logger responses
-- Client only sees KVS results
+## Related Documentation
 
-### 3. Quorum Verification
-`FailureScenariosTest` verifies:
-- System tolerates f=1 failures (2/3 replicas = f+1 quorum)
-- Operations succeed with reduced replica count
+- [../README.md](../README.md) — Project overview and full test-count breakdown
+- [../csmr-proxy/README.md](../csmr-proxy/README.md) — Routing YAML override
+- [../test-scripts/test-csmr-comprehensive.sh](../test-scripts/test-csmr-comprehensive.sh) — bash E2E harness
+- [../test-scripts/test-chaining.sh](../test-scripts/test-chaining.sh) — Chaining PoC 2 E2E
 
-### 4. Concurrency Testing
-`ConcurrencyTest` uses `CountDownLatch` to launch truly simultaneous operations:
-- 10 concurrent PUTs with synchronized start
-- 10 concurrent GETs with synchronized start
-- Verifies no lost writes under load
+---
 
-### 5. Performance Benchmarks
-`PerformanceBenchmarkTest` measures:
-- Single-request PUT/GET latency (20 iterations each)
-- Concurrent throughput (10 requests × 5 rounds)
+## Author
 
-## Configuration
+**Rodrigo W. Bonatto** — Universidade Federal de Santa Catarina (UFSC, 2026).
 
-Environment variables (matching bash scripts):
-- `PROXY_URL` - Proxy endpoint (auto-discovered by Testcontainers)
-- `READY_TIMEOUT_SECONDS` - Readiness timeout (default: 180)
-- `READY_POLL_INTERVAL_SECONDS` - Poll interval (default: 3)
+This work is part of the CSMR (Composing State Machine Replication) proof-of-concept.
 
-## CI/CD Integration
-
-These tests run in any environment with Docker:
-- GitHub Actions
-- GitLab CI
-- Jenkins
-- Local development
-
-No Kubernetes/Minikube required - uses the same Docker Compose stack as local development.
-
-## Extending Tests
-
-To add a new test scenario:
-
-1. Create a new test class following the naming pattern `*Test.java`
-2. Add `@ExtendWith(CsmrDockerComposeExtension.class)`
-3. Use `@BeforeAll` to get the client from the extension
-4. Add the class to `CsmrIntegrationTestSuite.java`
-
-## Debugging
-
-If tests fail:
-1. Check Docker Compose logs: `docker compose logs` (in project root)
-2. Inspect ZooKeeper topology: `docker exec csmr-project-zookeeper-1 zookeeper-shell localhost:2181 ls /ringpaxos`
-3. Check sidecar coordinator status: `docker compose logs sidecar-kvs-0 | grep -i coordinator`
-
-The `CsmrDockerComposeExtension` uses `.withTailChildContainers(true)` to capture all container logs in test output.
+- Project: [CSMR — Composing State Machine Replication with Multi-Ring Paxos](https://github.com/hrodric0/csmrarch)
+- Source: https://github.com/hrodric0/csmrarch

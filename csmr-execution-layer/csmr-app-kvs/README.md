@@ -130,7 +130,7 @@ or
 
 ### Build the module:
 ```bash
-cd /Users/rwbonatto/workspace/csmr-project
+cd <repo-root>
 mvn clean package -DskipTests -pl csmr-execution-layer/csmr-app-kvs
 ```
 
@@ -289,3 +289,13 @@ OutOfMemoryError: Java heap space
 
 - [csmr-sidecar-paxos/README.md](../csmr-sidecar-paxos/README.md) - Sidecar integration
 - [Alves 2026, Section 4.2] - SMR 2 formal definition
+---
+
+## Author
+
+**Rodrigo W. Bonatto** — Universidade Federal de Santa Catarina (UFSC, 2026).
+
+This work is part of the CSMR (Composing State Machine Replication) proof-of-concept.
+
+- Project: [CSMR — Composing State Machine Replication with Multi-Ring Paxos](https://github.com/hrodric0/csmrarch)
+- Source: https://github.com/hrodric0/csmrarch

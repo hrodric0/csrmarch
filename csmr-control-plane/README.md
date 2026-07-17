@@ -128,7 +128,7 @@ csmr-control-plane/
 
 ### Build the module:
 ```bash
-cd /Users/rwbonatto/workspace/csmr-project
+cd <repo-root>
 mvn clean package -DskipTests -pl csmr-control-plane
 ```
 
@@ -306,3 +306,13 @@ KeeperErrorCode = ConnectionLoss
 
 - [csmr-declarative-api/csmr-composition.yaml](../csmr-declarative-api/csmr-composition.yaml) - Composition manifest example
 - [csmr-declarative-api/crd-csmrcomposition.yaml](../csmr-declarative-api/crd-csmrcomposition.yaml) - CRD definition
+---
+
+## Author
+
+**Rodrigo W. Bonatto** — Universidade Federal de Santa Catarina (UFSC, 2026).
+
+This work is part of the CSMR (Composing State Machine Replication) proof-of-concept.
+
+- Project: [CSMR — Composing State Machine Replication with Multi-Ring Paxos](https://github.com/hrodric0/csmrarch)
+- Source: https://github.com/hrodric0/csmrarch

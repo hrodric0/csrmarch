@@ -1,3 +1,10 @@
+/**
+ * CSMR component.
+ *
+ * @author Rodrigo W. Bonatto (UFSC, 2026)
+ * @see <a href="https://github.com/hrodric0/csmrarch">CSMR Project</a>
+ */
+
 package br.ufsc.csmr.sidecar;
 
 import br.ufsc.csmr.sidecar.paxos.PaxosRingNode;

@@ -175,7 +175,7 @@ Phase 3 (Learners):
 
 ### Build the module:
 ```bash
-cd /Users/rwbonatto/workspace/csmr-project
+cd <repo-root>
 mvn clean package -DskipTests -pl csmr-execution-layer/csmr-sidecar-paxos
 ```
 
@@ -379,6 +379,17 @@ paxos.learner.buffer_size=1000
 
 ## Related Documentation
 
-- [URINGPAXOS_CONFIG.md](../../URINGPAXOS_CONFIG.md) - Detailed URingPaxos configuration
-- [test-csmr.sh](../../test-csmr.sh) - Readiness probing and coordinator election
+- [root README](../README.md) - URingPaxos prerequisite install (`ch.usi.da:paxos:trunk`)
+- [test-csmr-comprehensive.sh](../../test-scripts/test-csmr-comprehensive.sh) - Readiness probing and coordinator election
+- [test-chaining.sh](../../test-scripts/test-chaining.sh) - Chaining PoC 2 E2E
 - [URingPaxos](https://github.com/sambenz/URingPaxos) - URingPaxos library source
+---
+
+## Author
+
+**Rodrigo W. Bonatto** — Universidade Federal de Santa Catarina (UFSC, 2026).
+
+This work is part of the CSMR (Composing State Machine Replication) proof-of-concept.
+
+- Project: [CSMR — Composing State Machine Replication with Multi-Ring Paxos](https://github.com/hrodric0/csmrarch)
+- Source: https://github.com/hrodric0/csmrarch

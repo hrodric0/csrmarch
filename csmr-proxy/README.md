@@ -193,7 +193,7 @@ Return KVS ack to client
 
 ### Build the module:
 ```bash
-cd /Users/rwbonatto/workspace/csmr-project
+cd <repo-root>
 mvn clean package -DskipTests -pl csmr-proxy
 ```
 
@@ -406,6 +406,36 @@ Example: PRNG → Counter → Increment
 | `server.port` | `8080` | Proxy HTTP port |
 | `ZOOKEEPER_CONNECT` | `localhost:2181` | ZooKeeper connection string |
 | `composition.file` | `csmr-composition.yaml` | Path to composition manifest |
+| `CSMR_ROUTING_YAML_PATH` | *(unset → classpath)* | Runtime override of the composition YAML (see below) |
+
+### Runtime Composition Override (`CSMR_ROUTING_YAML_PATH`)
+
+The proxy resolves its composition YAML from the Spring property
+`csmr.routing.yaml-path`, which defaults to `classpath:csmr-composition.yaml`:
+
+```properties
+# csmr-proxy/src/main/resources/application.properties
+csmr.routing.yaml-path=${CSMR_ROUTING_YAML_PATH:classpath:csmr-composition.yaml}
+```
+
+- **Unset / empty** → loads the bundled `classpath:csmr-composition.yaml` (basic KVS +
+  Logger + Lock flows). An empty string is treated as "use default" — `YamlRoutingLoader`
+  falls back to the classpath resource instead of attempting to open a blank file path.
+- **Absolute path** → loads the YAML from the filesystem (e.g. the mounted
+  `full-csmr-composition.yaml` or `chaining-smr-composition.yaml`). In
+  `docker-compose.yml` the repo's `csmr-declarative-api/` is bind-mounted into the
+  proxy at `/config/composition`, so you can repoint with:
+  ```bash
+  CSMR_ROUTING_YAML_PATH=/config/composition/full-csmr-composition.yaml \
+    docker compose up -d --build
+  ```
+- **JVM flag** → equivalent override without an env var:
+  `java -Dcsmr.routing.yaml-path=/abs/path/full-csmr-composition.yaml -jar app.jar`.
+
+This is what lets a single proxy image serve Scenario 3 (`partitioned_put` →
+`kv_store_ring1`/`kv_store_ring2`), Scenario 4 (`sign_rsa` deprecation), and the
+Chaining PoC 2 (`init_counter` → PRNG → Counter) by swapping the manifest rather than
+rebuilding.
 
 ## Performance Considerations
 
@@ -438,3 +468,13 @@ Timeout waiting for quorum: [kv_store]
 
 - [csmr-declarative-api/csmr-composition.yaml](../csmr-declarative-api/csmr-composition.yaml) - Composition manifest schema
 - [test-csmr-comprehensive.sh](../test-csmr-comprehensive.sh) - Comprehensive test suite
+---
+
+## Author
+
+**Rodrigo W. Bonatto** — Universidade Federal de Santa Catarina (UFSC, 2026).
+
+This work is part of the CSMR (Composing State Machine Replication) proof-of-concept.
+
+- Project: [CSMR — Composing State Machine Replication with Multi-Ring Paxos](https://github.com/hrodric0/csmrarch)
+- Source: https://github.com/hrodric0/csmrarch
