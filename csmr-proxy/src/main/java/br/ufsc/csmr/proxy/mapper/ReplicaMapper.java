@@ -393,10 +393,11 @@ public class ReplicaMapper {
         ChainingProcessor.ChainResult result = chainingProcessor.execute(
                 stages,
                 params,
-                (service, method, input) -> {
+                (service, method, input, inputMapperName) -> {
                     // Dispatch to the target service/method with quorum collection
-                    log.debug("Chaining: dispatching to {}/{}", service, method);
-                    return dispatchToService(service, method, input);
+                    log.debug("Chaining: dispatching to {}/{} (input_mapper={})",
+                            service, method, inputMapperName);
+                    return dispatchToService(service, method, input, inputMapperName);
                 }
         );
 
@@ -423,6 +424,27 @@ public class ReplicaMapper {
      */
     private String dispatchToService(String service, String method, Map<String, String> params)
             throws Exception {
+        return dispatchToService(service, method, params, null);
+    }
+
+    /**
+     * Chaining variant: resolves and applies the stage's input_mapper by name
+     * (e.g. "CounterValueMapper") before collecting quorum. The mapper is applied
+     * regardless of entryFormat so chaining feedback loops can transform the
+     * previous stage's output into the next stage's input.
+     */
+    private String dispatchToService(String service, String method, Map<String, String> params, String inputMapperName)
+            throws Exception {
+
+        // Resolve the stage's input mapper (if any)
+        Optional<InputMapper> inputMapperOpt = Optional.empty();
+        if (inputMapperName != null && !inputMapperName.isBlank()) {
+            inputMapperOpt = inputMapperRegistry.getMapper(inputMapperName);
+            if (inputMapperOpt.isEmpty()) {
+                log.warn("Chaining stage references unknown input_mapper '{}'; dispatching without transformation",
+                        inputMapperName);
+            }
+        }
 
         // Get addresses for the service from RoutingTable (YAML or Docker Compose)
         List<String> addresses = routingTable.getAddressesForService(service);
@@ -430,8 +452,15 @@ public class ReplicaMapper {
         // Create a synthetic GroupRoute for the service
         List<GroupRoute> routes = List.of(new GroupRoute(service, method, addresses, null));
 
+        // Transform input via the mapper up-front (works for chaining where
+        // entryFormat is null), then collect quorum with no further transform.
+        Map<String, String> targetParams = params;
+        if (inputMapperOpt.isPresent()) {
+            targetParams = inputMapperOpt.get().map(params, service, method, null);
+        }
+
         // Collect quorum from the service
-        QuorumResult quorumResult = collectQuorumFromGroup(routes.get(0), method, params, Optional.empty());
+        QuorumResult quorumResult = collectQuorumFromGroup(routes.get(0), method, targetParams, Optional.empty());
 
         if (!quorumResult.achievedQuorum) {
             throw new IllegalStateException("Quorum not reached for service " + service);

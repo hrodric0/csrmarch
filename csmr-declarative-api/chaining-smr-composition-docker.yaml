@@ -1,0 +1,99 @@
+# =============================================================================
+# ChainingSMR Composition — PoC 2 (Docker Compose flavor)
+#
+# Docker Compose counterpart of chaining-smr-composition.yaml: uses compose
+# service names (sidecar-prng-* / sidecar-counter-*) instead of Kubernetes DNS.
+# Point the proxy at this file by setting CSMR_ROUTING_YAML_PATH=
+# /config/composition/chaining-smr-composition-docker.yaml.
+# =============================================================================
+apiVersion: csmr.ufsc.br/v1alpha1
+kind: CsmrComposition
+metadata:
+  name: chaining-smr-composition
+  namespace: csmr-poc
+
+spec:
+  toleratedFailures: 1
+
+  # ── Service definitions ────────────────────────────────────────────────────────
+  services:
+    prng_service:
+      addresses:
+        - "sidecar-prng-0:9000"
+        - "sidecar-prng-1:9000"
+        - "sidecar-prng-2:9000"
+      operations:
+        - method: "Generate"
+          params:
+            - name: "min"
+              type: "int"
+            - name: "max"
+              type: "int"
+          returns: "int"
+
+    counter_service:
+      addresses:
+        - "sidecar-counter-0:9000"
+        - "sidecar-counter-1:9000"
+        - "sidecar-counter-2:9000"
+      operations:
+        - method: "SetValue"
+          params:
+            - name: "value"
+              type: "int"
+          returns: "bool"
+
+        - method: "GetValue"
+          params: []
+          returns: "int"
+
+        - method: "Increment"
+          params:
+            - name: "amount"
+              type: "int"
+          returns: "int"
+
+  # ── Composition rules ──────────────────────────────────────────────────────────
+  compositions:
+    # ── PoC 2: ChainingSMR (PRNG → Counter) ──────────────────────────────────────
+    - name: "InitCounterWithRandom"
+      type: "Chaining"
+      method: "init_counter"
+      chaining_stages:
+        - stage_order: 1
+          target_service: "prng_service"
+          target_method: "Generate"
+          output_field: "result"
+          input_mapper: "PrngInputMapper"
+          wait_for_completion: true
+        - stage_order: 2
+          target_service: "counter_service"
+          target_method: "SetValue"
+          output_field: "result"
+          input_mapper: "CounterValueMapper"
+          wait_for_completion: true
+      return_intermediate: true
+
+    - name: "RandomIncrement"
+      type: "Chaining"
+      method: "random_increment"
+      chaining_stages:
+        - stage_order: 1
+          target_service: "prng_service"
+          target_method: "Generate"
+          output_field: "result"
+          input_mapper: "PrngInputMapper"
+          wait_for_completion: true
+        - stage_order: 2
+          target_service: "counter_service"
+          target_method: "SetValue"
+          output_field: "result"
+          input_mapper: "CounterValueMapper"
+          wait_for_completion: true
+        - stage_order: 3
+          target_service: "counter_service"
+          target_method: "Increment"
+          output_field: "result"
+          input_mapper: "IncrementInputMapper"
+          wait_for_completion: true
+      return_intermediate: false

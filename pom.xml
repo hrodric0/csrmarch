@@ -23,6 +23,8 @@
         <module>csmr-execution-layer/csmr-app-kvs</module>
         <module>csmr-execution-layer/csmr-app-log</module>
         <module>csmr-execution-layer/csmr-app-lockservice</module>
+        <module>csmr-execution-layer/csmr-app-prng</module>
+        <module>csmr-execution-layer/csmr-app-counter</module>
         <module>csmr-execution-layer/csmr-sidecar-paxos</module>
         <module>csmr-integration-tests</module>
     </modules>

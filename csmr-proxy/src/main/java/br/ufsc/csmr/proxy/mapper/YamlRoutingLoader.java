@@ -40,6 +40,14 @@ public class YamlRoutingLoader {
     public void load() {
         Yaml yaml = new Yaml();
 
+        // An empty/absent env override (e.g. CSMR_ROUTING_YAML_PATH="") must still
+        // resolve to the classpath default — otherwise Spring sets the value to "" and
+        // we'd fall through to the file branch with path "", which fails to open and
+        // silently drops to the legacy app-port default routing.
+        if (yamlPath == null || yamlPath.isBlank()) {
+            yamlPath = "classpath:csmr-composition.yaml";
+        }
+
         // Resolve the input source first so we can use try-with-resources for the stream.
         InputStream resolved;
         try {

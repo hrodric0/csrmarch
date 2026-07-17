@@ -89,14 +89,22 @@ public class RoutingTable {
         }
 
         for (CompositionRule rule : spec.getCompositions()) {
-            // Skip deprecated operations (Scenario 4)
+            String method = rule.getMethod().toLowerCase();
+
+            // Scenario 4 (Removing Operations): register deprecated rules so that
+            // ReplicaMapper.dispatch() can detect and reject them before any ring
+            // contact. We still index them in the table; resolve() returns an empty
+            // route set for DEPRECATED type as a defensive belt-and-suspenders measure
+            // (the proxy rejects on the deprecation check before reaching resolve()).
             if (rule.isDeprecated()) {
-                log.info("Skipping deprecated operation '{}' (reason: {})",
+                RouteDefinition depRoute = new RouteDefinition();
+                depRoute.type = RouteType.DEPRECATED;
+                depRoute.compositionRule = rule;
+                table.put(method, depRoute);
+                log.info("Registered DEPRECATED operation '{}' (reason: {}) — proxy will reject calls",
                         rule.getMethod(), rule.getRemovalReason());
                 continue;
             }
-
-            String method = rule.getMethod().toLowerCase();
 
             switch (rule.getType()) {
                 case "Addition":
@@ -109,6 +117,10 @@ public class RoutingTable {
 
                 case "Partition":
                     handlePartition(rule);
+                    break;
+
+                case "Chaining":
+                    handleChaining(rule);
                     break;
 
                 default:
@@ -206,12 +218,37 @@ public class RoutingTable {
     }
 
     /**
+     * Chaining SMRs (PoC 2): registers the chaining rule so the proxy can detect
+     * and dispatch it via ChainingProcessor. Unlike ADDITION/COMPOSITION/PARTITION,
+     * chaining stages are resolved and executed sequentially inside
+     * ReplicaMapper.executeChainingWorkflow(), so no static GroupRoute list is
+     * produced here — but the rule MUST be indexed (keyed by method) so that
+     * getCompositionRule() returns it and dispatch() routes into the chaining path
+     * instead of throwing "No routing rule found".
+     */
+    private void handleChaining(CompositionRule rule) {
+        if (rule.getChainingStages() == null || rule.getChainingStages().isEmpty()) {
+            log.warn("Chaining rule '{}' has no chaining_stages", rule.getName());
+            return;
+        }
+
+        RouteDefinition routeDef = new RouteDefinition();
+        routeDef.type = RouteType.CHAINING;
+        routeDef.compositionRule = rule;
+
+        table.put(rule.getMethod().toLowerCase(), routeDef);
+        log.info("Added route for '{}': Chaining type with {} stage(s), return_intermediate={}",
+                rule.getMethod(), rule.getChainingStages().size(), rule.isReturnIntermediate());
+    }
+
+    /**
      * Default PoC routing when YAML is not available.
      * Uses Docker Compose service names for local development.
      */
     private void initializeDefaultRouting() {
-        List<String> kvsAddresses = List.of("kvs-0:8081", "kvs-1:8081", "kvs-2:8081");
-        List<String> logAddresses = List.of("log-0:8082", "log-1:8082", "log-2:8082");
+        // Sidecar listener ports in Docker Compose (not the app container ports).
+        List<String> kvsAddresses = List.of("sidecar-kvs-0:9000", "sidecar-kvs-1:9000", "sidecar-kvs-2:9000");
+        List<String> logAddresses = List.of("sidecar-log-0:9000", "sidecar-log-1:9000", "sidecar-log-2:9000");
 
         // Cache these default addresses
         serviceAddressesCache.put("kv_store", kvsAddresses);
@@ -262,6 +299,14 @@ public class RoutingTable {
 
             case PARTITION:
                 routes = resolvePartition(routeDef, params);
+                break;
+
+            case DEPRECATED:
+                // Defensive: should never be reached — ReplicaMapper rejects the
+                // deprecated command on its pre-dispatch deprecation check.
+                log.warn("resolve() reached DEPRECATED route for '{}' — this should have been rejected upstream",
+                        command);
+                routes = Collections.emptyList();
                 break;
 
             default:
@@ -363,7 +408,7 @@ public class RoutingTable {
     // ─── Supporting types ───────────────────────────────────────────────────────
 
     /** Route type classification. */
-    public enum RouteType { STATIC, COMPOSITION, PARTITION }
+    public enum RouteType { STATIC, COMPOSITION, PARTITION, DEPRECATED, CHAINING }
 
     /** Route definition with metadata. */
     public static class RouteDefinition {

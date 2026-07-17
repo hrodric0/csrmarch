@@ -25,9 +25,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Models a single node in a U-Ring Paxos TCP Unicast ring.
@@ -60,6 +60,20 @@ public class PaxosRingNode {
     private final ObjectMapper objectMapper;
     private final ExecutorService deliveryExecutor;
     private final AtomicLong instanceCounter;
+
+    /**
+     * Instances proposed by THIS node. Recorded so the async decision listener
+     * (onDecision) does not redeliver them to the application — the proposer
+     * already delivered synchronously inside propose() to capture the app
+     * response. Ensures exactly-once execution per node.
+     */
+    private final Set<Long> selfProposedInstances = ConcurrentHashMap.newKeySet();
+
+    /**
+     * App response captured by the most recent synchronous delivery on the
+     * proposer path. Surfaced back to the proxy via SidecarController.
+     */
+    private volatile String capturedAppResponse;
 
     // URingPaxos objects
     private Node paxosNode;
@@ -282,7 +296,6 @@ public class PaxosRingNode {
      */
     private void awaitFullAcceptorMembership() {
         String barrierPath = BARRIER_PREFIX + "/topology" + ringIdNumeric;
-        String myReadyPath = barrierPath + "/ready-" + nodeId;
         int expected = ringMembers.size();
         ZooKeeper zk = null;
         try {
@@ -301,8 +314,11 @@ public class PaxosRingNode {
             ensureZnode(zk, BARRIER_PREFIX);
             ensureZnode(zk, barrierPath);
 
-            // Announce this node is ready
-            zk.create(myReadyPath, null, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+            // Announce this node is ready using integer-named znode (like acceptor znodes)
+            // This allows countIntegerChildren to correctly count ready nodes
+            // Use PERSISTENT so znodes survive ZK connection closure during barrier wait
+            String myReadyIntPath = barrierPath + "/" + nodeId;
+            zk.create(myReadyIntPath, null, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
             log.info("[{}] Node {} announced readiness at barrier.", ringId, nodeId);
 
             // Wait for all N nodes to announce readiness
@@ -320,6 +336,15 @@ public class PaxosRingNode {
                         ringId, present, expected);
             } else {
                 log.info("[{}] All {} nodes ready at barrier; proceeding to register acceptors.", ringId, expected);
+            }
+
+            // Clean up our barrier znode (PERSISTENT so we must delete explicitly)
+            try {
+                zk.delete(myReadyIntPath, -1);
+                log.debug("[{}] Cleaned up barrier znode: {}", ringId, myReadyIntPath);
+            } catch (KeeperException.NoNodeException ignored) {
+            } catch (Exception e) {
+                log.warn("[{}] Failed to clean up barrier znode {}: {}", ringId, myReadyIntPath, e.getMessage());
             }
 
         } catch (InterruptedException ie) {
@@ -387,7 +412,7 @@ public class PaxosRingNode {
     private static final String HEAL_KICK_CHILD = "999";
 
     /** Max time to wait at the startup barrier for all ring members to be ready. */
-    private static final long BARRIER_WAIT_MS = 60_000L;
+    private static final long BARRIER_WAIT_MS = 180_000L; // 3 minutes for full sidecar startup
     /** Poll interval while waiting at the startup barrier. */
     private static final long BARRIER_POLL_MS = 250L;
     /** ZK path prefix for the per-ring startup barrier. */
@@ -809,6 +834,24 @@ public class PaxosRingNode {
                     log.info("[{}] Instance {} decided on attempt {}: value={}",
                             ringId, learnedDecision.getInstance(), attempt,
                             new String(learnedDecision.getValue().getValue(), StandardCharsets.UTF_8));
+
+                    // Deliver to the application synchronously on the proposer node so the
+                    // app's response can be surfaced back to the proxy (required for
+                    // ChainingSMR output propagation and for compositions that read the
+                    // application's return value). Instances delivered here are recorded so
+                    // the async decision listener (onDecision) does NOT redeliver them,
+                    // preserving exactly-once execution per node.
+                    selfProposedInstances.add(instance);
+                    try {
+                        capturedAppResponse = deliverToApp(command);
+                        log.info("[{}] App response captured for instance {}: {}",
+                                ringId, instance, capturedAppResponse);
+                    } catch (Exception e) {
+                        log.warn("[{}] Proposer delivery to app failed for instance {}: {}",
+                                ringId, instance, e.getMessage());
+                        capturedAppResponse = null;
+                    }
+
                     return learnedDecision.getInstance();
                 } else {
                     log.warn("[{}] Null decision returned on attempt {}", ringId, attempt);
@@ -869,6 +912,15 @@ public class PaxosRingNode {
 
             log.info("[{}] Learned instance {}: {}", ringId, instance, command);
 
+            // If this node was the proposer for this instance, it already delivered
+            // the command synchronously inside propose() (and captured the app
+            // response). Skip redelivery here to preserve exactly-once execution.
+            if (selfProposedInstances.remove(instance)) {
+                log.debug("[{}] Instance {} was self-proposed; skipping async redelivery",
+                        ringId, instance);
+                return;
+            }
+
             // Deliver to application via IPC
             deliverToApp(command);
 
@@ -883,32 +935,37 @@ public class PaxosRingNode {
      * The application MUST ONLY process requests that arrive through this IPC channel.
      * Uses the /internal/execute endpoint which is not exposed externally.
      */
-    private void deliverToApp(Map<String, Object> command) {
+    private String deliverToApp(Map<String, Object> command) throws Exception {
         String url = "http://" + appHost + ":" + appPort + "/internal/execute";
 
-        try {
-            String jsonPayload = objectMapper.writeValueAsString(command);
-            log.debug("[{}] Delivering to app via IPC: {}", ringId, jsonPayload);
+        String jsonPayload = objectMapper.writeValueAsString(command);
+        log.debug("[{}] Delivering to app via IPC: {}", ringId, jsonPayload);
 
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .header("Content-Type", "application/json")
-                    .header("X-CSMR-Sidecar", "true")  // Marker for sidecar-originated requests
-                    .POST(HttpRequest.BodyPublishers.ofString(jsonPayload, StandardCharsets.UTF_8))
-                    .build();
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .header("X-CSMR-Sidecar", "true")  // Marker for sidecar-originated requests
+                .POST(HttpRequest.BodyPublishers.ofString(jsonPayload, StandardCharsets.UTF_8))
+                .build();
 
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
 
-            if (resp.statusCode() != 200) {
-                log.error("[{}] App returned non-200 for command '{}': {}",
-                        ringId, command, resp.statusCode());
-            } else {
-                log.debug("[{}] App executed '{}' → {}", ringId, command, resp.body());
-            }
-
-        } catch (Exception e) {
-            log.error("[{}] Failed to deliver command '{}' to app: {}", ringId, command, e.getMessage());
+        if (resp.statusCode() != 200) {
+            log.error("[{}] App returned non-200 for command '{}': {}",
+                    ringId, command, resp.statusCode());
+            return null;
         }
+
+        log.debug("[{}] App executed '{}' → {}", ringId, command, resp.body());
+        return resp.body();
+    }
+
+    /**
+     * App response captured by the proposer's synchronous delivery of the most
+     * recent instance. Surfaced back to the proxy. Null if no response captured.
+     */
+    public String getCapturedAppResponse() {
+        return capturedAppResponse;
     }
 
     /**

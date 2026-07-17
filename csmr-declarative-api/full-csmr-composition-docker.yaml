@@ -1,0 +1,161 @@
+# =============================================================================
+# CSMR Composition Manifest — Full Dissertation Scenarios (Docker Compose flavor)
+#
+# This is the Docker Compose counterpart of full-csmr-composition.yaml. It uses
+# compose service names (sidecar containers) instead of Kubernetes DNS names, so
+# the proxy can route live against `docker compose up --build`.
+#
+# Toggle at runtime by repointing the proxy:
+#   docker compose run --rm -e CSMR_ROUTING_YAML_PATH=/config/composition/full-csmr-composition-docker.yaml proxy
+# or by restarting the proxy service with that env var set.
+#
+# Demonstrates Scenario 3 (Argument Partition) and Scenario 4 (Removing Operations).
+# Scenario 1/2 references to lock_service / crypto_service are intentionally omitted
+# because those rings are not provisioned in docker-compose.yml.
+# =============================================================================
+apiVersion: csmr.ufsc.br/v1alpha1
+kind: CsmrComposition
+metadata:
+  name: full-csmr-composition
+  namespace: csmr-poc
+
+spec:
+  toleratedFailures: 1
+
+  # ── Service definitions ────────────────────────────────────────────────────────
+  services:
+    kv_store:
+      addresses:
+        - "sidecar-kvs-0:9000"
+        - "sidecar-kvs-1:9000"
+        - "sidecar-kvs-2:9000"
+      operations:
+        - method: "Get"
+          params:
+            - name: "key"
+              type: "string"
+          returns: "string"
+        - method: "Put"
+          params:
+            - name: "key"
+              type: "string"
+            - name: "value"
+              type: "string"
+          returns: "void"
+
+    logger:
+      addresses:
+        - "sidecar-log-0:9000"
+        - "sidecar-log-1:9000"
+        - "sidecar-log-2:9000"
+      operations:
+        - method: "Append"
+          params:
+            - name: "entry"
+              type: "string"
+          returns: "bool"
+        - method: "Retrieve"
+          params:
+            - name: "first"
+              type: "int"
+            - name: "last"
+              type: "int"
+          returns: "[]string"
+
+    kv_store_ring1:
+      addresses:
+        - "sidecar-kvs-ring1-0:9000"
+        - "sidecar-kvs-ring1-1:9000"
+        - "sidecar-kvs-ring1-2:9000"
+      operations:
+        - method: "Put"
+          params:
+            - name: "key"
+              type: "string"
+            - name: "value"
+              type: "string"
+          returns: "void"
+        - method: "Get"
+          params:
+            - name: "key"
+              type: "string"
+          returns: "string"
+
+    kv_store_ring2:
+      addresses:
+        - "sidecar-kvs-ring2-0:9000"
+        - "sidecar-kvs-ring2-1:9000"
+        - "sidecar-kvs-ring2-2:9000"
+      operations:
+        - method: "Put"
+          params:
+            - name: "key"
+              type: "string"
+            - name: "value"
+              type: "string"
+          returns: "void"
+        - method: "Get"
+          params:
+            - name: "key"
+              type: "string"
+          returns: "string"
+
+  # ── Composition rules ──────────────────────────────────────────────────────────
+  compositions:
+    # ── Scenario 2: Extending Operations' Execution ──────────────────────────────
+    - name: "PutWithLogging"
+      type: "Composition"
+      method: "put"
+      input_mapper: "PutInputMapper"
+      output_function: "KvsOutputFunction"
+      routing:
+        - target_service: "kv_store"
+          target_method: "Put"
+        - target_service: "logger"
+          target_method: "Append"
+          entry_format: "put({key},{value})"
+
+    - name: "GetWithLogging"
+      type: "Composition"
+      method: "get"
+      input_mapper: "GetInputMapper"
+      output_function: "KvsOutputFunction"
+      routing:
+        - target_service: "kv_store"
+          target_method: "Get"
+        - target_service: "logger"
+          target_method: "Append"
+          entry_format: "get({key})"
+
+    # ── Scenario 3: Argument Partition (Sharding) ────────────────────────────────
+    # partitioned_put: keys 'a-m' (and digits) → ring1, 'n-z' → ring2.
+    - name: "PartitionedKVS"
+      type: "Partition"
+      method: "partitioned_put"
+      partition_by: "key"
+      partition_rules:
+        - key_range: "a-m"
+          target_service: "kv_store_ring1"
+          target_method: "Put"
+        - key_range: "n-z"
+          target_service: "kv_store_ring2"
+          target_method: "Put"
+        - regex: "^[0-9]"
+          target_service: "kv_store_ring1"
+          target_method: "Put"
+
+    # ── Scenario 4: Removing Operations ──────────────────────────────────────────
+    # Deprecated RSA operations — the proxy rejects these before any ring contact.
+    - name: "RemoveRSA"
+      type: "Addition"
+      method: "sign_rsa"
+      service_operation: "crypto_service.Sign_RSA"
+      deprecated: true
+      removal_reason: "RSA-2048 is deprecated per NIST guidelines. Use ML-DSA instead."
+
+    - name: "RemoveVerifyRSA"
+      type: "Addition"
+      method: "verify_rsa"
+      service_operation: "crypto_service.Verify_RSA"
+      deprecated: true
+      removal_reason: "RSA verification is deprecated. Use ML-DSA instead."

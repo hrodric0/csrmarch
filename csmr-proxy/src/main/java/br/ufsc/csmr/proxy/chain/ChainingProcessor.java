@@ -69,11 +69,12 @@ public class ChainingProcessor {
             log.info("Executing stage {}/{}: {}/{}",
                     i + 1, stages.size(), stage.getTargetService(), stage.getTargetMethod());
 
-            // Dispatch to the target service
+            // Dispatch to the target service (applying the stage's input_mapper)
             String output = dispatchFn.dispatch(
                     stage.getTargetService(),
                     stage.getTargetMethod(),
-                    currentInput
+                    currentInput,
+                    stage.getInputMapper()
             );
 
             // Parse output to JSON map
@@ -90,7 +91,7 @@ public class ChainingProcessor {
             if (i < stages.size() - 1) {
                 String outputField = stage.getOutputField();
                 if (outputField != null && !outputField.isEmpty()) {
-                    Object extractedValue = outputMap.get(outputField);
+                    Object extractedValue = extractOutputField(outputMap, outputField);
                     if (extractedValue != null) {
                         // Pass extracted value to next stage
                         // In production, this would use an InputMapper for transformation
@@ -115,6 +116,49 @@ public class ChainingProcessor {
         log.info("Chaining workflow completed. Final output: {}", finalOutput);
 
         return new ChainResult(finalOutput, stageResults);
+    }
+
+    /**
+     * Extracts a named output field from a stage's proxy payload.
+     *
+     * The proxy payload from a sidecar has the shape:
+     *   {"group":..., "op":..., "params":..., "sidecar_response":
+     *       {"instance":N, "status":"decided", "ring":..., "app_response":"{...}"}, "address":...}
+     *
+     * The application's actual return value lives inside the embedded
+     * {@code app_response} JSON string (surfaced by the sidecar after synchronous
+     * delivery). This extracts {@code outputField} from there, falling back to a
+     * top-level field if present.
+     */
+    @SuppressWarnings("unchecked")
+    private Object extractOutputField(Map<String, Object> outputMap, String field) {
+        // 1. Top-level field (e.g. if already flattened by the proxy)
+        if (outputMap.containsKey(field)) {
+            return outputMap.get(field);
+        }
+
+        // 2. Inside sidecar_response.app_response (the real location)
+        Object sidecarResp = outputMap.get("sidecar_response");
+        if (sidecarResp instanceof Map) {
+            Map<String, Object> sr = (Map<String, Object>) sidecarResp;
+            Object appResp = sr.get("app_response");
+            Map<String, Object> appMap = null;
+            if (appResp instanceof Map) {
+                appMap = (Map<String, Object>) appResp;
+            } else if (appResp instanceof String && !((String) appResp).isBlank()) {
+                // app_response is embedded as a JSON string by the sidecar
+                try {
+                    appMap = objectMapper.readValue((String) appResp,
+                            new TypeReference<Map<String, Object>>() {});
+                } catch (Exception e) {
+                    log.warn("Could not parse embedded app_response for field '{}': {}", field, appResp);
+                }
+            }
+            if (appMap != null && appMap.containsKey(field)) {
+                return appMap.get(field);
+            }
+        }
+        return null;
     }
 
     /**
@@ -149,9 +193,11 @@ public class ChainingProcessor {
 
     /**
      * Function interface for dispatching to target services.
+     * {@code inputMapperName} is the stage's configured input_mapper (may be null),
+     * used to transform the chained input before it reaches the target ring.
      */
     @FunctionalInterface
     public interface DispatchFunction {
-        String dispatch(String service, String method, Map<String, String> input) throws Exception;
+        String dispatch(String service, String method, Map<String, String> input, String inputMapperName) throws Exception;
     }
 }

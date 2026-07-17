@@ -1,0 +1,21 @@
+# =============================================================================
+# Dockerfile — csmr-app-counter (Atomic Counter, Chaining PoC)
+# =============================================================================
+FROM eclipse-temurin:17-jre-alpine
+
+LABEL description="CSMR Counter — atomic counter SMR for the Chaining PoC (Alves 2026)"
+
+RUN addgroup -S csmr && adduser -S csmr -G csmr
+USER csmr
+WORKDIR /app
+
+COPY csmr-execution-layer/csmr-app-counter/target/csmr-app-counter-*.jar app.jar
+
+EXPOSE 8087
+
+ENV SERVER_PORT=8087
+
+ENTRYPOINT ["java", \
+  "-Xms128m", "-Xmx512m", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]

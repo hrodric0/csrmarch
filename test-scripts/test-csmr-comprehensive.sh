@@ -204,6 +204,40 @@ assert_decided() {
 # Stack Management
 # =============================================================================
 bring_up_stack() {
+    # $1 (optional): absolute path to a composition YAML the proxy should load
+    #     (via CSMR_ROUTING_YAML_PATH). When empty, the proxy uses its default
+    #     classpath composition (basic KVS/Log flows). The dissertation Scenarios
+    #     3/4 tests point the proxy at full-csmr-composition.yaml to expose the
+    #     partitioned_put and sign_rsa (deprecated) rules.
+    local routing_yaml="${1:-}"
+    local export_line=""
+    if [ -n "$routing_yaml" ]; then
+        export_line="CSMR_ROUTING_YAML_PATH=$routing_yaml"
+        log_detail "Proxy will load composition: $routing_yaml"
+    fi
+
+    # Guard: if the stack is already provisioned and the caller wants to reuse
+    # it (e.g. a pre-warmed, correctly-configured live stack), skip the
+    # destructive down -v / up --build sequence. Set CSMR_SKIP_BRINGUP=1.
+    # We still (re)point the proxy at the requested composition when one is
+    # given, because under skip the proxy keeps whatever YAML it last loaded —
+    # and the partition/deprecation scenarios REQUIRE the full composition.
+    if [ "${CSMR_SKIP_BRINGUP:-}" = "1" ]; then
+        log_section "Reusing existing CSMR stack (CSMR_SKIP_BRINGUP=1)"
+        log_detail "Skipping docker compose down -v / build; stack assumed running."
+        if [ -n "$routing_yaml" ] && ! docker compose ps --format '{{.Command}}' 2>/dev/null | grep -q "CSMR_ROUTING_YAML_PATH=$routing_yaml"; then
+            log_detail "Repointing proxy at: $routing_yaml (recreating proxy container)"
+            env $export_line docker compose up -d proxy >/dev/null 2>&1
+            # Give the proxy a moment to reload its routing table.
+            local rp=0
+            while [ "$rp" -lt 20 ]; do
+                if probe_proxy_ready; then break; fi
+                sleep 3; rp=$((rp + 1))
+            done
+        fi
+        return 0
+    fi
+
     log_section "Bringing up CSMR stack"
     log_detail "CSMR Architecture Overview:"
     log_detail "  - ZooKeeper: Service discovery & coordinator election metadata"
@@ -213,42 +247,40 @@ bring_up_stack() {
     log_detail "  - Proxy: Client gateway, composes responses via f(D)"
     log ""
 
-    log_step "Phase 1: Cleanup - Tearing down any prior stack"
-    log_detail "Purpose: Remove stale ZooKeeper acceptor znodes that would"
-    log_detail "         distort the acceptor set on next start"
-    docker compose down -v >/dev/null 2>&1
+    log_step "Phase 1: Build images (if needed)"
+    log_detail "Purpose: Ensure all images exist locally before start"
+    log_detail "         (separated from start to avoid coupling build with the"
+    log_detail "          Docker Desktop parallel-create race on ~21 containers)"
+    env $export_line docker compose build >/dev/null 2>&1 || {
+        log_result "FAIL" "docker compose build failed"
+        return 1
+    }
+    log "Images ready."
 
-    log_step "Phase 2: Build & Start - Building Docker images and starting services"
-    log_detail "Purpose: Build 13 containers (ZooKeeper, 6 app+sidecar pairs, proxy)"
-    log_detail "         Images contain: JAR files, Java 17 JRE, URingPaxos library"
+    log_step "Phase 2: Start services with convergence loop"
+    log_detail "Purpose: Start containers; 'up -d' is idempotent and recreates"
+    log_detail "         the proxy when its routing YAML env changes."
     log ""
 
-    log_detail "  → Building ZooKeeper (discovery service)..."
-    log_detail "    Purpose: Stores ring topology, acceptor endpoints, coordinator state"
-    log ""
+    log_detail "  → Starting services with convergence loop (mitigates create race)..."
+    local max_attempts=15
+    local attempt=0
+    local up_ok=0
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        attempt=$((attempt + 1))
+        # `up -d` is idempotent: it only (re)starts what is missing/stopped,
+        # and recreates the proxy when its routing YAML env changes.
+        env $export_line docker compose up -d >/dev/null 2>&1
+        if curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/health 2>/dev/null | grep -q 200; then
+            up_ok=1
+            break
+        fi
+        log_detail "    bring-up attempt $attempt: proxy not yet reachable, retrying..."
+        sleep 6
+    done
 
-    log_detail "  → Building KVS apps (3 replicas)..."
-    log_detail "    Purpose: SMR 2 - Key-Value Store state machines"
-    log_detail "    Reason: Multiple replicas for fault tolerance (f=1)"
-    log ""
-
-    log_detail "  → Building Log apps (3 replicas)..."
-    log_detail "    Purpose: SMR 3 - Logging/Audit state machines"
-    log_detail "    Reason: Multiple replicas for fault tolerance (f=1)"
-    log ""
-
-    log_detail "  → Building Paxos sidecars (6 total: 3 KVS + 3 Log)..."
-    log_detail "    Purpose: URingPaxos participants - coordinate consensus across replicas"
-    log_detail "    Reason: Each SMR ring needs Paxos for total order broadcast"
-    log ""
-
-    log_detail "  → Building Proxy (client gateway)..."
-    log_detail "    Purpose: REST API gateway, duplicates requests, applies f(D)"
-    log_detail "    Reason: Composition layer - routes to multiple rings, filters responses"
-    log ""
-
-    if ! docker compose up -d --build 2>&1 | grep -E "(Building|Creating|Starting|Healthy)" | head -20 >> "$LOG_FILE"; then
-        log_result "FAIL" "docker compose up failed"
+    if [ "$up_ok" -ne 1 ]; then
+        log_result "FAIL" "docker compose could not bring the stack (proxy) up within $max_attempts attempts"
         return 1
     fi
 
@@ -256,13 +288,12 @@ bring_up_stack() {
     log_step "Phase 3: Container startup sequence (depends_on chain)..."
     log_detail "  1. ZooKeeper → Health check → Ready"
     log_detail "  2. zk-init → Creates /ringpaxos topology → Exits (one-shot)"
-    log_detail "  3. sidecar-kvs-0 → Registers acceptor → Becomes coordinator → Health check"
-    log_detail "  4. sidecar-log-0 → Registers acceptor → Becomes coordinator → Health check"
-    log_detail "  5. Remaining sidecars (kvs-1, kvs-2, log-1, log-2) → Register as acceptors"
-    log_detail "  6. Proxy → Starts only after all sidecars healthy → Ready for traffic"
+    log_detail "  3. sidecar-<ring>-0 → Registers acceptor → Becomes coordinator → Health check"
+    log_detail "  4. Remaining sidecars → Register as acceptors"
+    log_detail "  5. Proxy → Starts only after sidecars healthy → Ready for traffic"
     log ""
 
-    log_result "PASS" "Stack started successfully - 13 containers running"
+    log_result "PASS" "Stack started successfully"
     return 0
 }
 
@@ -434,6 +465,129 @@ test_composition() {
     log_detail "Issued 3 PutWithLogging commands"
 
     log_result "PASS" "Composition operations completed successfully"
+}
+
+# =============================================================================
+# Test Scenario (Dissertation Scenario 3): Argument Partition (Sharding)
+# =============================================================================
+# Requires the proxy to be loaded with full-csmr-composition.yaml (the
+# PartitionedKVS rule routes partitioned_put by key first character:
+#   key a-m / [0-9]  -> kv_store_ring1
+#   key n-z          -> kv_store_ring2
+# The per-sidecar response embeds {"group":"kv_store_ring1"/"kv_store_ring2"},
+# which bubbles up into the proxy's top-level "result" string.
+test_partition() {
+    log_section "Test Scenario: Argument Partition (Dissertation Scenario 3)"
+
+    log_detail "Purpose: Verify CSMR argument-partition composition (sharding)"
+    log_detail "What we are testing:"
+    log_detail "  1. partitioned_put with key 'alpha' (a-m) routes to kv_store_ring1"
+    log_detail "  2. partitioned_put with key 'zebra' (n-z) routes to kv_store_ring2"
+    log_detail ""
+    log_detail "Why this matters (Alves 2026, Scenario 3):"
+    log_detail "  - Demonstrates load distribution across rings while preserving"
+    log_detail "    per-key atomicity: each key lives on exactly one ring."
+    log_detail "  - Fails if: partition rules are mis-resolved or both keys land on"
+    log_detail "    the same ring."
+    log ""
+
+    log_step "Testing partitioned_put on ring1 (key 'alpha' → a-m)..."
+    PART_R1=$(send_command \
+        '{"id":30,"method":"partitioned_put","params":{"key":"alpha","value":"v1"}}')
+    log_detail "Response: $PART_R1"
+    # The proxy wraps the per-sidecar ack (which carries "ring":"<ringId>") inside a
+    # top-level "result" JSON *string* (escaped quotes). Decode it: pull the result
+    # string, then parse the inner JSON to read sidecar_response.ring.
+    RING1=$(echo "$PART_R1" | jq -r '.result // empty' 2>/dev/null \
+        | jq -r '.sidecar_response.ring // empty' 2>/dev/null)
+    if [ "$RING1" = "kv_store_ring1" ]; then
+        log_result "PASS" "partitioned_put 'alpha' routed to kv_store_ring1"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        log_result "FAIL" "partitioned_put 'alpha' not routed to kv_store_ring1 (got: '${RING1:-<none>}')"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+
+    log_step "Testing partitioned_put on ring2 (key 'zebra' → n-z)..."
+    PART_R2=$(send_command \
+        '{"id":31,"method":"partitioned_put","params":{"key":"zebra","value":"v2"}}')
+    log_detail "Response: $PART_R2"
+    RING2=$(echo "$PART_R2" | jq -r '.result // empty' 2>/dev/null \
+        | jq -r '.sidecar_response.ring // empty' 2>/dev/null)
+    if [ "$RING2" = "kv_store_ring2" ]; then
+        log_result "PASS" "partitioned_put 'zebra' routed to kv_store_ring2"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        log_result "FAIL" "partitioned_put 'zebra' not routed to kv_store_ring2 (got: '${RING2:-<none>}')"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+
+    log_step "Verifying cross-ring isolation (keys must NOT land on the same ring)..."
+    if [ "$RING1" = "kv_store_ring1" ] && [ "$RING2" = "kv_store_ring2" ]; then
+        log_result "PASS" "Argument partition distributed keys across distinct rings"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        log_result "FAIL" "Keys did not partition across distinct rings (ring1='$RING1', ring2='$RING2')"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+}
+
+# =============================================================================
+# Test Scenario (Dissertation Scenario 4): Removing Operations (Deprecation)
+# =============================================================================
+# Requires the proxy to be loaded with full-csmr-composition.yaml (the RemoveRSA
+# rule marks sign_rsa as deprecated). ReplicaMapper.dispatch() rejects the command
+# BEFORE contacting any ring, returning HTTP 500 with an "error" field that embeds
+# the removal_reason.
+test_deprecation() {
+    log_section "Test Scenario: Removing Operations (Dissertation Scenario 4)"
+
+    log_detail "Purpose: Verify CSMR dynamic operation removal (deprecation)"
+    log_detail "What we are testing:"
+    log_detail "  1. sign_rsa (RSA-2048) is deprecated per the composition YAML"
+    log_detail "  2. Proxy rejects it and returns the removal_reason in the error"
+    log_detail ""
+    log_detail "Why this matters (Alves 2026, Scenario 4):"
+    log_detail "  - Demonstrates removing an SMR operation without touching running"
+    log_detail "    code — driven entirely by the declarative composition."
+    log_detail "  - Fails if: deprecated op is silently executed or rejected without reason."
+    log ""
+
+    log_step "Testing sign_rsa (deprecated RSA-2048 operation)..."
+    DEP_RESULT=$(send_command \
+        '{"id":40,"method":"sign_rsa","params":{"message":"hello","privateKey":"k"}}')
+    log_detail "Response: $DEP_RESULT"
+
+    # Deprecation rejection is surfaced in the "error" field with the removal reason.
+    if echo "$DEP_RESULT" | grep -qE "is deprecated"; then
+        log_result "PASS" "sign_rsa rejected as deprecated"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        log_result "FAIL" "sign_rsa was not rejected as deprecated (response: $DEP_RESULT)"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+        return 1
+    fi
+
+    if echo "$DEP_RESULT" | grep -qE "RSA-2048"; then
+        log_result "PASS" "Deprecation error includes removal_reason (RSA-2048)"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        log_result "FAIL" "Deprecation error missing removal_reason substring (RSA-2048)"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+        return 1
+    fi
+
+    log_step "Negative control: a NON-deprecated op must still succeed..."
+    OK_RESULT=$(send_command \
+        '{"id":41,"method":"put","params":{"key":"deprecation_ctrl","value":"ok"}}')
+    log_detail "Response: $OK_RESULT"
+    if echo "$OK_RESULT" | grep -qE '"result"'; then
+        log_result "PASS" "Non-deprecated operation still executes normally"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        log_result "FAIL" "Non-deprecated operation unexpectedly failed (response: $OK_RESULT)"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
 }
 
 # =============================================================================
@@ -842,8 +996,17 @@ main() {
     log "Scenario: $scenario"
 
     if [ "$scenario" = "all" ] || [ "$scenario" = "basic" ] || [ "$scenario" = "composition" ] || \
-       [ "$scenario" = "concurrency" ] || [ "$scenario" = "failure" ] || [ "$scenario" = "audit" ]; then
-        if ! bring_up_stack; then
+       [ "$scenario" = "concurrency" ] || [ "$scenario" = "failure" ] || [ "$scenario" = "audit" ] || \
+       [ "$scenario" = "partition" ] || [ "$scenario" = "deprecation" ]; then
+        # Dissertation Scenarios 3 & 4 need the proxy pointed at the full
+        # composition (which carries the PartitionedKVS and RemoveRSA rules).
+        local full_yaml="/config/composition/full-csmr-composition.yaml"
+        if [ "$scenario" = "partition" ] || [ "$scenario" = "deprecation" ]; then
+            if ! bring_up_stack "$full_yaml"; then
+                log_result "FAIL" "Stack startup failed. Aborting test."
+                exit 1
+            fi
+        elif ! bring_up_stack; then
             log_result "FAIL" "Stack startup failed. Aborting test."
             exit 1
         fi
@@ -890,9 +1053,15 @@ main() {
         performance)
             run_performance_benchmark
             ;;
+        partition)
+            test_partition
+            ;;
+        deprecation)
+            test_deprecation
+            ;;
         *)
             echo "Unknown scenario: $scenario"
-            echo "Available scenarios: all, basic, composition, logger, concurrency, failure, health, audit, performance"
+            echo "Available scenarios: all, basic, composition, logger, concurrency, failure, health, audit, performance, partition, deprecation"
             exit 1
             ;;
     esac

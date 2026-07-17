@@ -58,9 +58,37 @@ public class KvsOutputFunction implements OutputFunctionPlugin {
             return result;
         }
 
-        // Fallback: no KVS output available (e.g. all KVS replicas failed)
-        log.error("f(D): no successful KVS output found in D for operation '{}'.", operation);
+        // Fallback: no strictly "kv_store" output available.
+        // Tolerant to partition/shard rings (e.g. kv_store_ring1 / kv_store_ring2)
+        // which share the same KVS semantics but carry a different groupName. Prefer
+        // the first successful KVS-family output, else the first successful output of
+        // any group, so composition scenarios that route to a sharded ring still
+        // terminate at f(D) instead of throwing.
+        Optional<ReplicaOutput> kvsFamily = outputs.stream()
+                .filter(o -> o.groupName() != null && o.groupName().startsWith(KVS_GROUP))
+                .filter(ReplicaOutput::success)
+                .findFirst();
+
+        if (kvsFamily.isPresent()) {
+            String result = kvsFamily.get().payload();
+            log.info("f(D) selected KVS-family output (partition/shard) for '{}': {}", operation, result);
+            return result;
+        }
+
+        Optional<ReplicaOutput> anyOutput = outputs.stream()
+                .filter(ReplicaOutput::success)
+                .findFirst();
+
+        if (anyOutput.isPresent()) {
+            String result = anyOutput.get().payload();
+            log.warn("f(D): no KVS-family output for '{}'; returning first successful output from group '{}'.",
+                    operation, anyOutput.get().groupName());
+            return result;
+        }
+
+        // Truly nothing succeeded.
+        log.error("f(D): no successful output found in D for operation '{}'.", operation);
         throw new IllegalStateException(
-                "No successful KVS replica response in collectible outputs for: " + operation);
+                "No successful replica response in collectible outputs for: " + operation);
     }
 }

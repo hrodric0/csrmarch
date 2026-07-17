@@ -95,6 +95,42 @@ services:
         create /ringpaxos/topology2/acceptors ''
         echo "URingPaxos acceptor parents provisioned."
 
+        # --- Dissertation Scenario 3 (Argument Partition) rings ---
+        # kv_store_ring1 -> topology3, kv_store_ring2 -> topology4.
+        # Each is a fresh 3-node KVS ring so partitioned_put routes keys in [a-m]
+        # to ring1 and [n-z] to ring2 (see full-csmr-composition.yaml PartitionedKVS).
+        create /csmr/rings/kv_store_ring1 ''
+        create /csmr/rings/kv_store_ring1/members ''
+        create /csmr/rings/kv_store_ring1/members/0 'sidecar-kvs-ring1-0:9000'
+        create /csmr/rings/kv_store_ring1/members/1 'sidecar-kvs-ring1-1:9000'
+        create /csmr/rings/kv_store_ring1/members/2 'sidecar-kvs-ring1-2:9000'
+        create /csmr/rings/kv_store_ring2 ''
+        create /csmr/rings/kv_store_ring2/members ''
+        create /csmr/rings/kv_store_ring2/members/0 'sidecar-kvs-ring2-0:9000'
+        create /csmr/rings/kv_store_ring2/members/1 'sidecar-kvs-ring2-1:9000'
+        create /csmr/rings/kv_store_ring2/members/2 'sidecar-kvs-ring2-2:9000'
+        create /csmr/rings/prng_service ''
+        create /csmr/rings/prng_service/members ''
+        create /csmr/rings/prng_service/members/0 'sidecar-prng-0:9000'
+        create /csmr/rings/prng_service/members/1 'sidecar-prng-1:9000'
+        create /csmr/rings/prng_service/members/2 'sidecar-prng-2:9000'
+        create /csmr/rings/counter_service ''
+        create /csmr/rings/counter_service/members ''
+        create /csmr/rings/counter_service/members/0 'sidecar-counter-0:9000'
+        create /csmr/rings/counter_service/members/1 'sidecar-counter-1:9000'
+        create /csmr/rings/counter_service/members/2 'sidecar-counter-2:9000'
+        echo "Dissertation ring membership (partition rings + chaining services) provisioned."
+
+        create /ringpaxos/topology3 ''
+        create /ringpaxos/topology3/acceptors ''
+        create /ringpaxos/topology4 ''
+        create /ringpaxos/topology4/acceptors ''
+        create /ringpaxos/topology5 ''
+        create /ringpaxos/topology5/acceptors ''
+        create /ringpaxos/topology6 ''
+        create /ringpaxos/topology6/acceptors ''
+        echo "URingPaxos acceptor parents (topology3-6) provisioned."
+
   # ── CSMR Control Plane (Operator) ────────────────────────────────────────────
   # Note: Control plane requires Kubernetes API. Disabled in Docker Compose mode.
   # Uncomment and configure kubeconfig if running with Minikube.
@@ -119,6 +155,13 @@ services:
       - "8080:8080"
     environment:
       ZOOKEEPER_CONNECT: "zookeeper:2181"
+      # Empty (default) => proxy loads the bundled classpath composition. The E2E
+      # test scripts override this env when bringing up the stack so the proxy can
+      # load a specific bundled YAML without a host bind-mount:
+      #   - Scenario 3/4: /config/composition/full-csmr-composition.yaml
+      #   - Chaining PoC: /config/composition/chaining-smr-composition.yaml
+      # (Both are baked into the proxy image by docker/Dockerfile.proxy.)
+      CSMR_ROUTING_YAML_PATH: "${CSMR_ROUTING_YAML_PATH:-}"
     depends_on:
       zookeeper:
         condition: service_healthy
@@ -133,6 +176,33 @@ services:
       sidecar-log-1:
         condition: service_healthy
       sidecar-log-2:
+        condition: service_healthy
+      # Scenario 3 (Argument Partition) rings — so the proxy only comes up once
+      # partitioned_put can reach both kv_store_ring1 and kv_store_ring2.
+      sidecar-kvs-ring1-0:
+        condition: service_healthy
+      sidecar-kvs-ring1-1:
+        condition: service_healthy
+      sidecar-kvs-ring1-2:
+        condition: service_healthy
+      sidecar-kvs-ring2-0:
+        condition: service_healthy
+      sidecar-kvs-ring2-1:
+        condition: service_healthy
+      sidecar-kvs-ring2-2:
+        condition: service_healthy
+      # PoC2 Chaining SMRs (init_counter chains prng_service -> counter_service).
+      sidecar-prng-0:
+        condition: service_healthy
+      sidecar-prng-1:
+        condition: service_healthy
+      sidecar-prng-2:
+        condition: service_healthy
+      sidecar-counter-0:
+        condition: service_healthy
+      sidecar-counter-1:
+        condition: service_healthy
+      sidecar-counter-2:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
@@ -400,6 +470,518 @@ services:
       log-2:
         condition: service_started
       sidecar-log-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ── Scenario 3 (Argument Partition) Ring 1: kv_store_ring1 (topology3) ────────
+  kvs-ring1-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-kvs
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-kvs-ring1-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "kv_store_ring1"
+      RING_ID_NUMERIC: "3"
+      RING_SIZE: "3"
+      NODE_ID: "0"
+      APP_PORT: "8081"
+      APP_HOST: "kvs-ring1-0"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19020:9000"
+    expose:
+      - "9000"
+    depends_on:
+      kvs-ring1-0:
+        condition: service_started
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  kvs-ring1-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-kvs
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-kvs-ring1-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "kv_store_ring1"
+      RING_ID_NUMERIC: "3"
+      RING_SIZE: "3"
+      NODE_ID: "1"
+      APP_PORT: "8081"
+      APP_HOST: "kvs-ring1-1"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19021:9000"
+    expose:
+      - "9000"
+    depends_on:
+      kvs-ring1-1:
+        condition: service_started
+      sidecar-kvs-ring1-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  kvs-ring1-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-kvs
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-kvs-ring1-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "kv_store_ring1"
+      RING_ID_NUMERIC: "3"
+      RING_SIZE: "3"
+      NODE_ID: "2"
+      APP_PORT: "8081"
+      APP_HOST: "kvs-ring1-2"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19022:9000"
+    expose:
+      - "9000"
+    depends_on:
+      kvs-ring1-2:
+        condition: service_started
+      sidecar-kvs-ring1-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ── Scenario 3 (Argument Partition) Ring 2: kv_store_ring2 (topology4) ────────
+  kvs-ring2-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-kvs
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-kvs-ring2-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "kv_store_ring2"
+      RING_ID_NUMERIC: "4"
+      RING_SIZE: "3"
+      NODE_ID: "0"
+      APP_PORT: "8081"
+      APP_HOST: "kvs-ring2-0"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19030:9000"
+    expose:
+      - "9000"
+    depends_on:
+      kvs-ring2-0:
+        condition: service_started
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  kvs-ring2-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-kvs
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-kvs-ring2-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "kv_store_ring2"
+      RING_ID_NUMERIC: "4"
+      RING_SIZE: "3"
+      NODE_ID: "1"
+      APP_PORT: "8081"
+      APP_HOST: "kvs-ring2-1"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19031:9000"
+    expose:
+      - "9000"
+    depends_on:
+      kvs-ring2-1:
+        condition: service_started
+      sidecar-kvs-ring2-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  kvs-ring2-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-kvs
+    environment:
+      SERVER_PORT: "8081"
+    expose:
+      - "8081"
+
+  sidecar-kvs-ring2-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "kv_store_ring2"
+      RING_ID_NUMERIC: "4"
+      RING_SIZE: "3"
+      NODE_ID: "2"
+      APP_PORT: "8081"
+      APP_HOST: "kvs-ring2-2"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19032:9000"
+    expose:
+      - "9000"
+    depends_on:
+      kvs-ring2-2:
+        condition: service_started
+      sidecar-kvs-ring2-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ── PoC2 Chaining SMRs: PRNG service (topology5) ─────────────────────────────
+  prng-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-prng
+    environment:
+      SERVER_PORT: "8086"
+    expose:
+      - "8086"
+
+  sidecar-prng-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "prng_service"
+      RING_ID_NUMERIC: "5"
+      RING_SIZE: "3"
+      NODE_ID: "0"
+      APP_PORT: "8086"
+      APP_HOST: "prng-0"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19040:9000"
+    expose:
+      - "9000"
+    depends_on:
+      prng-0:
+        condition: service_started
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  prng-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-prng
+    environment:
+      SERVER_PORT: "8086"
+    expose:
+      - "8086"
+
+  sidecar-prng-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "prng_service"
+      RING_ID_NUMERIC: "5"
+      RING_SIZE: "3"
+      NODE_ID: "1"
+      APP_PORT: "8086"
+      APP_HOST: "prng-1"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19041:9000"
+    expose:
+      - "9000"
+    depends_on:
+      prng-1:
+        condition: service_started
+      sidecar-prng-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  prng-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-prng
+    environment:
+      SERVER_PORT: "8086"
+    expose:
+      - "8086"
+
+  sidecar-prng-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "prng_service"
+      RING_ID_NUMERIC: "5"
+      RING_SIZE: "3"
+      NODE_ID: "2"
+      APP_PORT: "8086"
+      APP_HOST: "prng-2"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19042:9000"
+    expose:
+      - "9000"
+    depends_on:
+      prng-2:
+        condition: service_started
+      sidecar-prng-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ── PoC2 Chaining SMRs: Counter service (topology6) ──────────────────────────
+  counter-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-counter
+    environment:
+      SERVER_PORT: "8087"
+    expose:
+      - "8087"
+
+  sidecar-counter-0:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "counter_service"
+      RING_ID_NUMERIC: "6"
+      RING_SIZE: "3"
+      NODE_ID: "0"
+      APP_PORT: "8087"
+      APP_HOST: "counter-0"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19050:9000"
+    expose:
+      - "9000"
+    depends_on:
+      counter-0:
+        condition: service_started
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  counter-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-counter
+    environment:
+      SERVER_PORT: "8087"
+    expose:
+      - "8087"
+
+  sidecar-counter-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "counter_service"
+      RING_ID_NUMERIC: "6"
+      RING_SIZE: "3"
+      NODE_ID: "1"
+      APP_PORT: "8087"
+      APP_HOST: "counter-1"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19051:9000"
+    expose:
+      - "9000"
+    depends_on:
+      counter-1:
+        condition: service_started
+      sidecar-counter-0:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      zk-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  counter-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app-counter
+    environment:
+      SERVER_PORT: "8087"
+    expose:
+      - "8087"
+
+  sidecar-counter-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sidecar-paxos
+    environment:
+      ZOOKEEPER_CONNECT: "zookeeper:2181"
+      RING_ID: "counter_service"
+      RING_ID_NUMERIC: "6"
+      RING_SIZE: "3"
+      NODE_ID: "2"
+      APP_PORT: "8087"
+      APP_HOST: "counter-2"
+      STABLE_STORAGE_TYPE: "InMemory"
+      JAVA_TOOL_OPTIONS: "-XX:MaxDirectMemorySize=256m -Xmx512m -Dpaxos.learner.auto_trim=true -Dpaxos.learner.buffer_size=1000"
+    ports:
+      - "19052:9000"
+    expose:
+      - "9000"
+    depends_on:
+      counter-2:
+        condition: service_started
+      sidecar-counter-0:
         condition: service_healthy
       zookeeper:
         condition: service_healthy

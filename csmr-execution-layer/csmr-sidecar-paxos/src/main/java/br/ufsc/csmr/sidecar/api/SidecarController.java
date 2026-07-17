@@ -53,7 +53,8 @@ public class SidecarController {
             return ResponseEntity.ok(Map.of(
                     "instance", instance,
                     "status", "decided",
-                    "ring", paxosRingNode.getRingId()
+                    "ring", paxosRingNode.getRingId(),
+                    "app_response", paxosRingNode.getCapturedAppResponse()
             ));
 
         } catch (Exception e) {

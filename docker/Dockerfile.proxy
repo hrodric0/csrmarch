@@ -7,6 +7,20 @@ LABEL maintainer="Rodrigo Bonatto <bonatto@inf.ufsc.br>"
 LABEL description="CSMR Proxy — ReplicaMapper, OutputProcessing f(D), REST API"
 
 RUN addgroup -S csmr && adduser -S csmr -G csmr
+
+# Bake the declarative composition YAMLs into the image so the proxy can load a
+# non-default composition at runtime via CSMR_ROUTING_YAML_PATH (e.g.
+# /config/composition/full-csmr-composition.yaml for Scenario 3/4, or
+# /config/composition/chaining-smr-composition.yaml for the Chaining PoC). This
+# avoids relying on a host bind-mount of the repo's csmr-declarative-api dir,
+# which Docker Desktop on macOS blocks for the /host_mnt path resolution.
+# The compose-flavored YAMLs (compose service names) are installed under the
+# base filenames the E2E tests reference.
+RUN mkdir -p /config/composition
+COPY csmr-declarative-api/full-csmr-composition-docker.yaml      /config/composition/full-csmr-composition.yaml
+COPY csmr-declarative-api/chaining-smr-composition-docker.yaml   /config/composition/chaining-smr-composition.yaml
+RUN chown -R csmr:csmr /config/composition
+
 USER csmr
 
 WORKDIR /app
