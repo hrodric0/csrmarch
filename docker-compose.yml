@@ -34,13 +34,13 @@ services:
       retries: 5
 
   # ── CSMR ring membership / URingPaxos topology ───────────────────────────────
-  # NOTE: No external zk-init job. Docker Compose has no control plane, but each
-  # sidecar now SELF-PROVISIONS its own /csmr/rings/<ringId>/members/<nodeId> entry
-  # at startup (PaxosRingNode.provisionCsmrMembership) and the URingPaxos
+  # Docker Compose has no control plane, but each sidecar SELF-PROVISIONS its own
+  # /csmr/rings/<ringId>/members/<nodeId> entry at startup
+  # (PaxosRingNode.provisionCsmrMembership) and the URingPaxos
   # /ringpaxos/topology<N>/acceptors parents (ensureAcceptorsParentExists). This
-  # removes the serialized 30-60 s zk-init block and lets all six rings start in
-  # parallel. Membership is read by ZooKeeperRingDiscovery from the self-written
-  # znodes, so sidecars no longer depend_on an external init container.
+  # lets all six rings start in parallel. Membership is read by
+  # ZooKeeperRingDiscovery from the self-written znodes, so sidecars need no
+  # external provisioning step.
 
   # ── CSMR Control Plane (Operator) ────────────────────────────────────────────
   # Note: Control plane requires Kubernetes API. Disabled in Docker Compose mode.

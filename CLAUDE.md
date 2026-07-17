@@ -48,7 +48,7 @@ mvn test -Dtest=CompositionCheckerTest -pl csmr-control-plane
 
 ### Docker Compose (local dev - no Kubernetes)
 
-**Important: Docker Compose mode runs WITHOUT the control-plane.** The control plane is a Kubernetes operator that requires Kubernetes API access. In Docker Compose, sidecars use pre-provisioned ZooKeeper entries for ring discovery.
+**Important: Docker Compose mode runs WITHOUT the control-plane.** The control plane is a Kubernetes operator that requires Kubernetes API access. In Docker Compose, each sidecar self-provisions all required ZooKeeper entries on startup — no external provisioning step is needed.
 
 ```bash
 # First, build JAR files
@@ -57,10 +57,18 @@ mvn clean package -DskipTests
 # Start full stack (control-plane is disabled in docker-compose.yml)
 docker compose up --build
 
-# Ring discovery is automatic: each sidecar self-registers its node/acceptor
-# znodes under URingPaxos's /ringpaxos/topology<N>/... tree on startup, and the
-# lowest-ID acceptor is elected coordinator. No manual ring provisioning is
-# required for Docker Compose.
+# Ring discovery is automatic: each sidecar self-registers two ZooKeeper trees on
+# startup, and the lowest-ID acceptor is elected coordinator. No manual provisioning
+# is required for Docker Compose:
+#   - URingPaxos topology: /ringpaxos/topology<N>/acceptors/...   (coordinator election)
+#   - CSMR membership:     /csmr/rings/<ringId>/members/<nodeId> = "<host>:<SERVER_PORT>"
+#     (written by PaxosRingNode.provisionCsmrMembership(); read by
+#      ZooKeeperRingDiscovery.discoverMembers()). Sidecars self-provision these
+#     entries on startup, so no external provisioning container is needed and the
+#     serialized startup block is eliminated.
+#
+# Disable the proposal-retry backoff for latency benchmarks (default 250 ms):
+#   PAXOS_BACKOFF_MS=0   (or -Dpaxos.backoff.ms=0)
 #
 # NOTE: the ZooKeeper service uses the confluentinc image, whose CLI is
 # `zookeeper-shell localhost:2181` (NOT zkCli.sh). To inspect the live topology:
@@ -405,3 +413,21 @@ Inspect election state with:
 the token ring's successor links from the other nodes and wedges the ring
 ("Coordinator timeout in phase1 reservation" + stale-proposal replay). Recover with
 a full `docker compose restart` of the ring's sidecars (or the whole stack).
+
+#### 8. Sidecars self-provision ring membership (no external provisioning step)
+**Design**: Each sidecar writes its own `/csmr/rings/<ringId>/members/<nodeId>` entry
+(PaxosRingNode.provisionCsmrMembership, called as step 0 of `start()`), so
+`ZooKeeperRingDiscovery.discoverMembers()` sees a complete, consistent member set without
+a separate provisioning container. Self-provisioning removes a serialized startup block
+and lets all six rings start in parallel. Sidecars only `depends_on` `zookeeper` (healthy)
+and — for followers — `sidecar-<ring>-0`. If discovery ever returns an empty set, check
+that the sidecar actually reached `provisionCsmrMembership()` (look for the "Provisioned
+CSMR membership" log line) and that ZooKeeper was reachable at that point.
+
+#### 9. Paxos proposal-retry backoff dominates tail latency when benchmarking
+**Issue**: The proposer sleeps between coordinator-election retry attempts. Default 250 ms
+is honest for cold start but, once a coordinator is present, proposals complete in the
+single-digit ms — so the sleep otherwise dominates tail measurements.
+**Fix**: The backoff is disablable. Set `PAXOS_BACKOFF_MS=0` (env) or `-Dpaxos.backoff.ms=0`
+(JVM) on the sidecars; `resolveBackoffMs()` then returns 0 and no `Thread.sleep` occurs in
+the hot path. The `PerformanceBenchmarkTest` runs best with the backoff disabled.

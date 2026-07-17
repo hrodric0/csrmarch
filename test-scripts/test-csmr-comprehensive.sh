@@ -287,10 +287,9 @@ bring_up_stack() {
     log ""
     log_step "Phase 3: Container startup sequence (depends_on chain)..."
     log_detail "  1. ZooKeeper → Health check → Ready"
-    log_detail "  2. zk-init → Creates /ringpaxos topology → Exits (one-shot)"
-    log_detail "  3. sidecar-<ring>-0 → Registers acceptor → Becomes coordinator → Health check"
-    log_detail "  4. Remaining sidecars → Register as acceptors"
-    log_detail "  5. Proxy → Starts only after sidecars healthy → Ready for traffic"
+    log_detail "  2. sidecar-<ring>-0 → Registers acceptor + self-provisions CSMR membership → Becomes coordinator → Health check"
+    log_detail "  3. Remaining sidecars → Register as acceptors + self-provision membership"
+    log_detail "  4. Proxy → Starts only after sidecars healthy → Ready for traffic"
     log ""
 
     log_result "PASS" "Stack started successfully"

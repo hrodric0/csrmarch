@@ -16,7 +16,7 @@ stack).
 | `FailureScenariosTest` | `f+1` fault tolerance (replica stop/start) |
 | `SystemHealthTest` | Docker / ZooKeeper topology health |
 | `AuditLoggingTest` | Transparent audit via `f(D)` |
-| `PerformanceBenchmarkTest` | Latency / throughput benchmark |
+| `PerformanceBenchmarkTest` | Latency / throughput benchmark with warmup + p50/p95/p99 percentiles |
 | `PartitionTest` | Scenario 3: `partitioned_put` key-range sharding (`kv_store_ring1` a-m / `kv_store_ring2` n-z) |
 | `DeprecationTest` | Scenario 4: deprecated `sign_rsa` rejected with removal reason |
 | `ChainingTest` | Chaining PoC 2: `init_counter` → PRNG.Generate → Counter.SetValue |
@@ -55,6 +55,36 @@ mvn test -pl csmr-integration-tests
 
 > Prerequisite: the `ch.usi.da:paxos:trunk` (URingPaxos) artifact must be
 > installed into your local `~/.m2` (see root `README.md`).
+
+## Performance Benchmark Protocol
+
+`PerformanceBenchmarkTest` produces latency percentiles rather than a single
+aggregate. This mirrors the `run_performance_benchmark()` harness in
+`test-csmr-comprehensive.sh`.
+
+1. **Readiness gate** — the `CsmrDockerComposeExtension` `@BeforeAll` keeps probing
+   `/api/command` until a real top-level `"result"` returns, which only happens once
+   every targeted Paxos ring has elected a coordinator and can order proposals. The
+   benchmark never assumes readiness after a fixed `sleep`.
+2. **Warmup** (`testWarmup`, `WARMUP_COMMANDS = 100`) — a burst of PUTs whose
+   latencies are discarded so the JIT, TCP connections, and Paxos ring are hot.
+3. **Measured batches** — `testPutLatency` records per-command latency for 200 PUTs and
+   `testGetLatency` for 100 GETs; `testThroughput` fires 10 concurrent requests × 5
+   rounds.
+4. **Percentiles** — `percentile()` + `reportPercentiles()` compute and log
+   **p50 / p95 / p99** (plus min/max) per operation, and `assertWithinCeiling` guards
+   against any single command exceeding a sane bound.
+
+The compose path in `CsmrDockerComposeExtension` is hardcoded to this repo
+(`/Users/rwbonatto/Downloads/csmrarch/docker-compose.yml`); change `COMPOSE_FILE` /
+`COMPOSE_PROJECT_DIR` for a different checkout.
+
+For honest tail numbers, disable the sidecar proposal-retry backoff:
+
+```bash
+PAXOS_BACKOFF_MS=0 docker compose up -d --build
+mvn test -pl csmr-integration-tests -Dtest=PerformanceBenchmarkTest
+```
 
 ## Scenario Coverage
 

@@ -183,6 +183,13 @@ public class PaxosRingNode {
                 ringId, nodeId, ringMembers.size(), stableStorageType);
 
         try {
+            // Step 0: Self-provision CSMR membership. Every sidecar writes its own
+            // /csmr/rings/<ringId>/members/<nodeId> entry (idempotent), so
+            // ZooKeeperRingDiscovery.discoverMembers() finds a complete member set without
+            // a separate provisioning container. Node 0 writes its entry before followers
+            // start, so the discovery step sees a consistent set.
+            provisionCsmrMembership();
+
             // Step 1: Create RingDescription with all roles
             List<PaxosRole> roles = new ArrayList<>();
             roles.add(PaxosRole.Proposer);
@@ -195,12 +202,6 @@ public class PaxosRingNode {
             List<RingDescription> rings = new ArrayList<>();
             rings.add(ringDescription);
 
-            // Step 0: Self-provision CSMR membership. This replaces the external zk-init
-            // job. Every sidecar writes its own /csmr/rings/<ringId>/members/<nodeId> entry
-            // (idempotent), so ZooKeeperRingDiscovery.discoverMembers() finds a complete
-            // member set without a separate provisioning container. Node 0 writes its
-            // entry before followers start, so the discovery step sees a consistent set.
-            provisionCsmrMembership();
 
             // Step 3: Pre-seed the stable_storage config znode BEFORE the Node starts.
             // URingPaxos AcceptorRole selects its StableStorage by reading the FQCN from
@@ -210,7 +211,7 @@ public class PaxosRingNode {
             seedStableStorageConfig();
 
             // Step 3b: Ensure acceptors parent znode exists (arms RingManager watch for coordinator election).
-            // zk-init also does this, but we do it idempotently here in case of direct sidecar start.
+            // Done idempotently here so a sidecar can also start standalone (outside Docker Compose).
             ensureAcceptorsParentExists();
 
             // Step 3c: Clean up any stale ephemeral acceptor znode for this node from a prior run.
@@ -294,7 +295,7 @@ public class PaxosRingNode {
     /**
      * CSMR membership prefix (ZooKeeperRingDiscovery.BASE_PATH). Each sidecar
      * self-provisions {@code /csmr/rings/<ringId>/members/<nodeId>} = "<host>:<serverPort>"
-     * at startup so the discovery step no longer needs an external zk-init job.
+     * at startup, so the discovery step needs no external provisioning job.
      */
     private static final String CSMR_MEMBERSHIP_PREFIX = "/csmr/rings";
 
@@ -619,9 +620,9 @@ public class PaxosRingNode {
 
     /**
      * Self-provisions the CSMR ring membership entry that {@code ZooKeeperRingDiscovery}
-     * reads. Replaces the external zk-init container: each sidecar writes only its OWN
+     * reads. Each sidecar writes only its OWN
      * {@code /csmr/rings/<ringId>/members/<nodeId>} = "<host>:<serverPort>". This removes
-     * the serialized 30–60 s zk-init startup block and the need for a separate provisioning
+     * the serialized startup block and the need for a separate provisioning
      * service. All writes are idempotent, so restarts/re-runs are safe.
      */
     private void provisionCsmrMembership() {
