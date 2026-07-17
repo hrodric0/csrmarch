@@ -33,103 +33,14 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── ZooKeeper ring-membership initializer (one-shot) ─────────────────────────
-  # In Kubernetes the control-plane operator provisions /csmr/rings/* via
-  # ZooKeeperRingProvisioner. Docker Compose has no control plane, so this one-shot
-  # job seeds the CSMR membership layer that each sidecar's ZooKeeperRingDiscovery
-  # reads at startup (path /csmr/rings/<ringId>/members/<nodeId>, data = sidecar
-  # address). Without it sidecars discover 0 members and start degenerate 1-node
-  # rings. Idempotent (tolerates NodeExists) so it re-seeds on every `up`, including
-  # after a ZooKeeper restart wipes the (non-persistent) tree. All sidecars
-  # depend_on this via service_completed_successfully.
-  zk-init:
-    image: confluentinc/cp-zookeeper:7.6.0
-    depends_on:
-      zookeeper:
-        condition: service_healthy
-    restart: "no"
-    entrypoint: ["bash", "-c"]
-    ports: []
-    command:
-      - |
-        set -e
-        ZK=zookeeper:2181
-        create() {
-          # create <path> [data]; ignore "already exists"
-          zookeeper-shell "$$ZK" create "$$1" "$${2:-}" 2>&1 | grep -v 'NodeExists' || true
-        }
-        echo "Provisioning /csmr/rings membership in ZooKeeper at $$ZK ..."
-        create /csmr ''
-        create /csmr/rings ''
-        create /csmr/rings/kv_store_Put ''
-        create /csmr/rings/kv_store_Put/members ''
-        create /csmr/rings/kv_store_Put/members/0 'sidecar-kvs-0:9000'
-        create /csmr/rings/kv_store_Put/members/1 'sidecar-kvs-1:9000'
-        create /csmr/rings/kv_store_Put/members/2 'sidecar-kvs-2:9000'
-        create /csmr/rings/logger_Append ''
-        create /csmr/rings/logger_Append/members ''
-        create /csmr/rings/logger_Append/members/0 'sidecar-log-0:9000'
-        create /csmr/rings/logger_Append/members/1 'sidecar-log-1:9000'
-        create /csmr/rings/logger_Append/members/2 'sidecar-log-2:9000'
-        echo "ZooKeeper ring membership provisioned."
-        # --- URingPaxos acceptor-watch race fix (cold start) ---
-        # URingPaxos RingManager.init()->getConfig() reads /ringpaxos/topology<N>/acceptors
-        # with a one-shot watch (RingManager.java:111) BEFORE this node registers its own
-        # acceptor znode (Node.java:129 init runs before :143 registerRole). On a cold start
-        # the /acceptors parent does not exist yet, so getChildren throws NoNodeException
-        # (caught/ignored at RingManager.java:120): NO watch is armed and `last_acceptor`
-        # stays frozen at 0. process()'s acceptor branch then never fires, so Phase1/Phase1Range
-        # tokens are never re-addressed to the coordinator (the last_acceptor==self check fails)
-        # and return to the coordinator with quorum 0 -> "ring end without quorum (0)" ->
-        # "Coordinator timeout in phase1 reservation" -> proxy "Quorum not reached".
-        # Pre-creating the PERSISTENT parent makes getChildren return [] and ARM the watch, so
-        # subsequent NodeChildrenChanged events recompute last_acceptor=max=2 on every node.
-        # URingPaxos creates this same parent lazily as PERSISTENT guarded by an exists() check
-        # (TopologyManager.java:486-488), so pre-creating it is idempotent and skips that create
-        # (no NodeExistsException). topology1=kv_store_Put, topology2=logger_Append.
-        echo "Pre-creating URingPaxos /acceptors parents to arm the election watch ..."
-        create /ringpaxos ''
-        create /ringpaxos/topology1 ''
-        create /ringpaxos/topology1/acceptors ''
-        create /ringpaxos/topology2 ''
-        create /ringpaxos/topology2/acceptors ''
-        echo "URingPaxos acceptor parents provisioned."
-
-        # --- Dissertation Scenario 3 (Argument Partition) rings ---
-        # kv_store_ring1 -> topology3, kv_store_ring2 -> topology4.
-        # Each is a fresh 3-node KVS ring so partitioned_put routes keys in [a-m]
-        # to ring1 and [n-z] to ring2 (see full-csmr-composition.yaml PartitionedKVS).
-        create /csmr/rings/kv_store_ring1 ''
-        create /csmr/rings/kv_store_ring1/members ''
-        create /csmr/rings/kv_store_ring1/members/0 'sidecar-kvs-ring1-0:9000'
-        create /csmr/rings/kv_store_ring1/members/1 'sidecar-kvs-ring1-1:9000'
-        create /csmr/rings/kv_store_ring1/members/2 'sidecar-kvs-ring1-2:9000'
-        create /csmr/rings/kv_store_ring2 ''
-        create /csmr/rings/kv_store_ring2/members ''
-        create /csmr/rings/kv_store_ring2/members/0 'sidecar-kvs-ring2-0:9000'
-        create /csmr/rings/kv_store_ring2/members/1 'sidecar-kvs-ring2-1:9000'
-        create /csmr/rings/kv_store_ring2/members/2 'sidecar-kvs-ring2-2:9000'
-        create /csmr/rings/prng_service ''
-        create /csmr/rings/prng_service/members ''
-        create /csmr/rings/prng_service/members/0 'sidecar-prng-0:9000'
-        create /csmr/rings/prng_service/members/1 'sidecar-prng-1:9000'
-        create /csmr/rings/prng_service/members/2 'sidecar-prng-2:9000'
-        create /csmr/rings/counter_service ''
-        create /csmr/rings/counter_service/members ''
-        create /csmr/rings/counter_service/members/0 'sidecar-counter-0:9000'
-        create /csmr/rings/counter_service/members/1 'sidecar-counter-1:9000'
-        create /csmr/rings/counter_service/members/2 'sidecar-counter-2:9000'
-        echo "Dissertation ring membership (partition rings + chaining services) provisioned."
-
-        create /ringpaxos/topology3 ''
-        create /ringpaxos/topology3/acceptors ''
-        create /ringpaxos/topology4 ''
-        create /ringpaxos/topology4/acceptors ''
-        create /ringpaxos/topology5 ''
-        create /ringpaxos/topology5/acceptors ''
-        create /ringpaxos/topology6 ''
-        create /ringpaxos/topology6/acceptors ''
-        echo "URingPaxos acceptor parents (topology3-6) provisioned."
+  # ── CSMR ring membership / URingPaxos topology ───────────────────────────────
+  # NOTE: No external zk-init job. Docker Compose has no control plane, but each
+  # sidecar now SELF-PROVISIONS its own /csmr/rings/<ringId>/members/<nodeId> entry
+  # at startup (PaxosRingNode.provisionCsmrMembership) and the URingPaxos
+  # /ringpaxos/topology<N>/acceptors parents (ensureAcceptorsParentExists). This
+  # removes the serialized 30-60 s zk-init block and lets all six rings start in
+  # parallel. Membership is read by ZooKeeperRingDiscovery from the self-written
+  # znodes, so sidecars no longer depend_on an external init container.
 
   # ── CSMR Control Plane (Operator) ────────────────────────────────────────────
   # Note: Control plane requires Kubernetes API. Disabled in Docker Compose mode.
@@ -251,8 +162,6 @@ services:
         condition: service_started
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -297,8 +206,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -341,8 +248,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -385,8 +290,6 @@ services:
         condition: service_started
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -429,8 +332,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -473,8 +374,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -515,8 +414,6 @@ services:
         condition: service_started
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -558,8 +455,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -601,8 +496,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -643,8 +536,6 @@ services:
         condition: service_started
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -686,8 +577,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -729,8 +618,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -771,8 +658,6 @@ services:
         condition: service_started
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -814,8 +699,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -857,8 +740,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -899,8 +780,6 @@ services:
         condition: service_started
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -942,8 +821,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s
@@ -985,8 +862,6 @@ services:
         condition: service_healthy
       zookeeper:
         condition: service_healthy
-      zk-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9000/internal/health"]
       interval: 10s

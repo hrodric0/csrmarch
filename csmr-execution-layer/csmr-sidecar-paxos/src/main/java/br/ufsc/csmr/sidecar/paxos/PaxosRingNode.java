@@ -24,6 +24,7 @@ import org.apache.zookeeper.ZooKeeper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -194,6 +195,13 @@ public class PaxosRingNode {
             List<RingDescription> rings = new ArrayList<>();
             rings.add(ringDescription);
 
+            // Step 0: Self-provision CSMR membership. This replaces the external zk-init
+            // job. Every sidecar writes its own /csmr/rings/<ringId>/members/<nodeId> entry
+            // (idempotent), so ZooKeeperRingDiscovery.discoverMembers() finds a complete
+            // member set without a separate provisioning container. Node 0 writes its
+            // entry before followers start, so the discovery step sees a consistent set.
+            provisionCsmrMembership();
+
             // Step 3: Pre-seed the stable_storage config znode BEFORE the Node starts.
             // URingPaxos AcceptorRole selects its StableStorage by reading the FQCN from
             // /ringpaxos/topology<ring>/config/stable_storage and Class.forName(fqcn).newInstance().
@@ -282,6 +290,22 @@ public class PaxosRingNode {
 
     /** URingPaxos ZooKeeper prefix used by RingManager (see ch.usi.da.paxos.ring.RingManager). */
     private static final String RINGPAXOS_PREFIX = "/ringpaxos";
+
+    /**
+     * CSMR membership prefix (ZooKeeperRingDiscovery.BASE_PATH). Each sidecar
+     * self-provisions {@code /csmr/rings/<ringId>/members/<nodeId>} = "<host>:<serverPort>"
+     * at startup so the discovery step no longer needs an external zk-init job.
+     */
+    private static final String CSMR_MEMBERSHIP_PREFIX = "/csmr/rings";
+
+    /**
+     * Paxos proposal-timeout retry backoff (ms). Also configurable at runtime via
+     * {@code -Dpaxos.backoff.ms=N} or {@code PAXOS_BACKOFF_MS=N}. Set to 0 to disable
+     * the sleep entirely for latency benchmarks (only matters during the cold-start
+     * window before a coordinator is elected; once steady, proposals succeed in single-digit ms).
+     * Default 250 ms keeps tail latency honest without a large artificial floor.
+     */
+    private static final long DEFAULT_BACKOFF_MS = 250L;
 
     /** Max time a follower waits for node 0's acceptor znode before proceeding anyway. */
     private static final long NODE0_ACCEPTOR_WAIT_MS = 60_000L;
@@ -594,6 +618,92 @@ public class PaxosRingNode {
     }
 
     /**
+     * Self-provisions the CSMR ring membership entry that {@code ZooKeeperRingDiscovery}
+     * reads. Replaces the external zk-init container: each sidecar writes only its OWN
+     * {@code /csmr/rings/<ringId>/members/<nodeId>} = "<host>:<serverPort>". This removes
+     * the serialized 30–60 s zk-init startup block and the need for a separate provisioning
+     * service. All writes are idempotent, so restarts/re-runs are safe.
+     */
+    private void provisionCsmrMembership() {
+        String ringPath = CSMR_MEMBERSHIP_PREFIX + "/" + ringId;
+        String membersPath = ringPath + "/members";
+        String myMemberPath = membersPath + "/" + nodeId;
+
+        String host = resolveHostname();
+        int serverPort = parseIntEnv("SERVER_PORT", 9000);
+        byte[] address = (host + ":" + serverPort).getBytes(StandardCharsets.UTF_8);
+
+        ZooKeeper zk = null;
+        try {
+            CountDownLatch connected = new CountDownLatch(1);
+            zk = new ZooKeeper(zkConnect, 10000, event -> {
+                if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
+                    connected.countDown();
+                }
+            });
+            if (!connected.await(10, TimeUnit.SECONDS)) {
+                log.warn("[{}] ZooKeeper connect timeout while provisioning membership; "
+                        + "discovery may be incomplete.", ringId);
+                return;
+            }
+
+            ensureZnode(zk, CSMR_MEMBERSHIP_PREFIX);
+            ensureZnode(zk, ringPath);
+            ensureZnode(zk, membersPath);
+
+            // Create / overwrite this node's own membership entry (PERSISTENT, so it
+            // survives follower restarts; stale entries are harmless for discovery).
+            if (zk.exists(myMemberPath, false) == null) {
+                try {
+                    zk.create(myMemberPath, address, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+                } catch (KeeperException.NodeExistsException ignored) {
+                    // meanwhile another incarnation wrote it — fine
+                }
+            }
+            log.info("[{}] Self-provisioned membership {}='{}'", ringId, myMemberPath, new String(address, StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            log.warn("[{}] Failed to self-provision membership: {}. Discovery may be incomplete.",
+                    ringId, e.getMessage());
+        } finally {
+            if (zk != null) {
+                try { zk.close(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            }
+        }
+    }
+
+    /** Resolves this container's Docker DNS name (defaults to the compose service name). */
+    private String resolveHostname() {
+        try {
+            return InetAddress.getLocalHost().getHostName();
+        } catch (Exception e) {
+            return System.getenv().getOrDefault("HOSTNAME", "127.0.0.1");
+        }
+    }
+
+    private static int parseIntEnv(String name, int fallback) {
+        String v = System.getenv(name);
+        if (v == null) return fallback;
+        try {
+            return Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    /** Resolves the retry backoff (ms) from {@code -Dpaxos.backoff.ms} or {@code PAXOS_BACKOFF_MS}. */
+    private long resolveBackoffMs() {
+        String sys = System.getProperty("paxos.backoff.ms");
+        if (sys != null) {
+            try { return Long.parseLong(sys.trim()); } catch (NumberFormatException ignored) { }
+        }
+        String env = System.getenv("PAXOS_BACKOFF_MS");
+        if (env != null) {
+            try { return Long.parseLong(env.trim()); } catch (NumberFormatException ignored) { }
+        }
+        return DEFAULT_BACKOFF_MS;
+    }
+
+    /**
      * Ensures the URingPaxos acceptors parent znode exists.
      * This arms the RingManager's watch on the acceptor path so that when
      * node 0 registers its acceptor, the NodeChildrenChanged event fires
@@ -870,10 +980,14 @@ public class PaxosRingNode {
                         ringId, attempt, MAX_RETRIES, e.getMessage());
 
                 if (attempt < MAX_RETRIES) {
-                    // Linear backoff: 2 seconds
-                    long backoffMs = 2000L;
-                    log.debug("[{}] Backing off for {}ms before retry", ringId, backoffMs);
-                    Thread.sleep(backoffMs);
+                    // Linear backoff: 250 ms. Low value keeps tail latency honest for
+                    // benchmarking; once a coordinator is elected timeouts are rare so
+                    // this only matters during the brief cold-start window.
+                    long backoffMs = resolveBackoffMs();
+                    if (backoffMs > 0) {
+                        log.debug("[{}] Backing off for {}ms before retry", ringId, backoffMs);
+                        Thread.sleep(backoffMs);
+                    }
                 } else {
                     log.error("[{}] All {} retry attempts failed for instance {}", ringId, MAX_RETRIES, instance);
                     throw new TimeoutException(
@@ -886,8 +1000,10 @@ public class PaxosRingNode {
                     throw new RuntimeException("Failed to propose command after " + MAX_RETRIES + " attempts", e);
                 }
                 // Retry on other exceptions too
-                long backoffMs = 2000L;
-                Thread.sleep(backoffMs);
+                long backoffMs = resolveBackoffMs();
+                if (backoffMs > 0) {
+                    Thread.sleep(backoffMs);
+                }
             }
         }
 

@@ -11,7 +11,7 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -21,11 +21,18 @@ import static org.junit.jupiter.api.Assertions.*;
  * Performance Benchmarking
  * Mirrors run_performance_benchmark() from test-csmr-comprehensive.sh
  *
- * Purpose: Measure system performance - latency and throughput under load
- * What we are measuring:
- *   1. Single-request PUT latency (20 iterations, average)
- *   2. Single-request GET latency (20 iterations, average)
- *   3. Concurrent throughput (10 requests/batch, 5 rounds, avg req/s)
+ * The extension (@BeforeAll) gates on proxy readiness — it keeps probing /api/command
+ * until a real "result" comes back, which only happens once every targeted Paxos ring
+ * has elected a coordinator and can order proposals. Because readiness is polled rather
+ * than assumed after a fixed sleep, the benchmark runs against a warm ring.
+ *
+ * Measurement protocol (matches the harness requirements):
+ *   1. Warmup: send a burst of commands and discard their latencies so the JIT, TCP
+ *      connections, and Paxos ring are hot before any timed measurement.
+ *   2. Measured batch: send a sequence of commands, recording each end-to-end latency.
+ *   3. Percentiles: compute p50 / p95 / p99 from the recorded latencies and assert
+ *      they stay within sane bounds (no artificial hot-path latency floor — the Paxos
+ *      backoff is disablable via -Dpaxos.backoff.ms=0 for benchmarking).
  */
 @ExtendWith(CsmrDockerComposeExtension.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -33,6 +40,12 @@ import static org.junit.jupiter.api.Assertions.*;
 class PerformanceBenchmarkTest {
 
     private CsmrProxyClient client;
+
+    // Per-run configuration. Tune for your machine / CI budget.
+    private static final int WARMUP_COMMANDS = 100;
+    private static final int MEASURED_PUTS = 200;
+    private static final int MEASURED_GETS = 100;
+    private static final long LATENCY_CEILING_MS = 30_000; // sanity bound for any single command
 
     @BeforeAll
     void setup(CsmrDockerComposeExtension extension) {
@@ -46,9 +59,9 @@ class PerformanceBenchmarkTest {
 
     @Test
     @Order(1)
-    @DisplayName("Warm up the system")
+    @DisplayName("Warm up the system (latency discarded)")
     void testWarmup() throws Exception {
-        for (int i = 1; i <= 5; i++) {
+        for (int i = 1; i <= WARMUP_COMMANDS; i++) {
             String response = client.sendCommand("put", Map.of(
                 "key", "warmup_" + i,
                 "value", "value_" + i
@@ -56,72 +69,67 @@ class PerformanceBenchmarkTest {
             assertTrue(client.hasResult(response) || client.isDecided(response),
                 "Warmup PUT " + i + " should succeed. Response: " + response);
         }
+        System.out.println("Completed " + WARMUP_COMMANDS + " warmup commands (latencies discarded).");
     }
 
     @Test
     @Order(2)
-    @DisplayName("Benchmark single PUT latency (20 iterations)")
+    @DisplayName("Benchmark single PUT latency (p50/p95/p99)")
     void testPutLatency() throws Exception {
-        int iterations = 20;
-        long totalTime = 0;
+        List<Long> latencies = new ArrayList<>(MEASURED_PUTS);
         int successCount = 0;
 
-        for (int i = 1; i <= iterations; i++) {
+        for (int i = 1; i <= MEASURED_PUTS; i++) {
             long start = System.nanoTime();
             String response = client.sendCommand("put", Map.of(
-                "key", "perf_" + i,
+                "key", "perf_put_" + i,
                 "value", "value_" + i
             ));
             long end = System.nanoTime();
             long latencyMs = (end - start) / 1_000_000;
 
-            totalTime += latencyMs;
-
             if (client.hasResult(response) || client.isDecided(response)) {
                 successCount++;
+                latencies.add(latencyMs);
+            } else {
+                System.out.println("PUT " + i + " had no result: " + response);
             }
-
-            System.out.println("PUT iteration " + i + ": " + latencyMs + "ms");
         }
 
-        assertEquals(iterations, successCount, "All PUT iterations should succeed");
-        double avgLatency = (double) totalTime / iterations;
-        System.out.println("Average PUT latency: " + avgLatency + "ms");
-
-        // Assert reasonable latency (adjust threshold as needed)
-        assertTrue(avgLatency < 30000, "Average PUT latency should be under 30s. Actual: " + avgLatency + "ms");
+        assertEquals(MEASURED_PUTS, successCount, "All measured PUTs should succeed");
+        reportPercentiles("PUT", latencies);
+        assertWithinCeiling(latencies);
     }
 
     @Test
     @Order(3)
-    @DisplayName("Benchmark single GET latency (20 iterations)")
+    @DisplayName("Benchmark single GET latency (p50/p95/p99)")
     void testGetLatency() throws Exception {
-        int iterations = 20;
-        long totalTime = 0;
+        // Seed keys so GETs hit existing state.
+        for (int i = 1; i <= MEASURED_GETS; i++) {
+            client.sendCommand("put", Map.of("key", "perf_get_" + i, "value", "value_" + i));
+        }
+
+        List<Long> latencies = new ArrayList<>(MEASURED_GETS);
         int successCount = 0;
 
-        for (int i = 1; i <= iterations; i++) {
+        for (int i = 1; i <= MEASURED_GETS; i++) {
             long start = System.nanoTime();
-            String response = client.sendCommand("get", Map.of(
-                "key", "perf_" + i
-            ));
+            String response = client.sendCommand("get", Map.of("key", "perf_get_" + i));
             long end = System.nanoTime();
             long latencyMs = (end - start) / 1_000_000;
 
-            totalTime += latencyMs;
-
             if (client.hasResult(response) || client.isDecided(response)) {
                 successCount++;
+                latencies.add(latencyMs);
+            } else {
+                System.out.println("GET " + i + " had no result: " + response);
             }
-
-            System.out.println("GET iteration " + i + ": " + latencyMs + "ms");
         }
 
-        assertEquals(iterations, successCount, "All GET iterations should succeed");
-        double avgLatency = (double) totalTime / iterations;
-        System.out.println("Average GET latency: " + avgLatency + "ms");
-
-        assertTrue(avgLatency < 30000, "Average GET latency should be under 30s. Actual: " + avgLatency + "ms");
+        assertEquals(MEASURED_GETS, successCount, "All measured GETs should succeed");
+        reportPercentiles("GET", latencies);
+        assertWithinCeiling(latencies);
     }
 
     @Test
@@ -176,5 +184,33 @@ class PerformanceBenchmarkTest {
         System.out.println("Average throughput: " + avgThroughput + " req/s");
 
         assertTrue(avgThroughput > 0, "Should achieve some throughput");
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────────
+
+    private void reportPercentiles(String op, List<Long> latencies) {
+        List<Long> sorted = new ArrayList<>(latencies);
+        Collections.sort(sorted);
+        int n = sorted.size();
+        System.out.println(op + " measured commands: " + n);
+        System.out.println("  p50  = " + percentile(sorted, 50) + " ms");
+        System.out.println("  p95  = " + percentile(sorted, 95) + " ms");
+        System.out.println("  p99  = " + percentile(sorted, 99) + " ms");
+        System.out.println("  min  = " + sorted.get(0) + " ms");
+        System.out.println("  max  = " + sorted.get(n - 1) + " ms");
+    }
+
+    private long percentile(List<Long> sorted, int pct) {
+        if (sorted.isEmpty()) return 0;
+        // Nearest-rank method: index = ceil(pct/100 * n) - 1
+        int idx = (int) Math.ceil(pct / 100.0 * sorted.size()) - 1;
+        idx = Math.max(0, Math.min(sorted.size() - 1, idx));
+        return sorted.get(idx);
+    }
+
+    private void assertWithinCeiling(List<Long> latencies) {
+        long max = Collections.max(latencies);
+        assertTrue(max < LATENCY_CEILING_MS,
+            "Max latency " + max + "ms exceeded ceiling " + LATENCY_CEILING_MS + "ms — check readiness gate / backoff");
     }
 }

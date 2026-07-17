@@ -28,7 +28,8 @@ import java.util.concurrent.TimeUnit;
  */
 public class CsmrDockerComposeExtension implements BeforeAllCallback, AfterAllCallback, ParameterResolver {
 
-    private static final String COMPOSE_FILE = "/Users/rwbonatto/workspace/csmr-project/docker-compose.yml";
+    private static final String COMPOSE_FILE = "/Users/rwbonatto/Downloads/csmrarch/docker-compose.yml";
+    private static final String COMPOSE_PROJECT_DIR = "/Users/rwbonatto/Downloads/csmrarch";
     private static final String COMPOSE_PROJECT_NAME = "csmr-project";
     private static final int READY_TIMEOUT_SECONDS = 180;
     private static final int READY_POLL_INTERVAL_SECONDS = 3;
@@ -55,7 +56,7 @@ public class CsmrDockerComposeExtension implements BeforeAllCallback, AfterAllCa
     private void verifyStackRunning() {
         try {
             Process checkProcess = new ProcessBuilder("docker", "compose", "-p", COMPOSE_PROJECT_NAME, "ps", "--services", "--filter", "status=running")
-                .directory(new File("/Users/rwbonatto/workspace/csmr-project"))
+                .directory(new File(COMPOSE_PROJECT_DIR))
                 .start();
             checkProcess.waitFor(10, TimeUnit.SECONDS);
             String output = new String(checkProcess.getInputStream().readAllBytes());
