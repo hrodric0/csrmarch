@@ -918,7 +918,8 @@ public class PaxosRingNode {
      * Retry logic:
      *   - Max 3 attempts for extremely slow ring consensus
      *   - 120-second timeout per attempt (URingPaxos Paxos phases can be very slow in Docker)
-     *   - Linear backoff between retries (2 seconds)
+     *   - Backoff between retries resolved via resolveBackoffMs() (default 250 ms, disablable
+     *     to 0 via PAXOS_BACKOFF_MS env or -Dpaxos.backoff.ms for latency benchmarks)
      *
      * NOTE: URingPaxos can require substantial time for Paxos phases under load.
      * Especially on first proposal of each node (initialization phase).
