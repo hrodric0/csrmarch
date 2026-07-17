@@ -20,7 +20,7 @@
 # Prereqs:
 #   - Docker + docker compose
 #   - mvn-built JARs (run `mvn clean package -DskipTests` first)
-#   - URingPaxos installed in ~/.m2 (see CLAUDE.md)
+#   - URingPaxos installed in ~/.m2
 # =============================================================================
 
 set -uo pipefail
