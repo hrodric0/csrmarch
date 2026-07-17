@@ -31,6 +31,7 @@ Thumbs.db
 
 # Temporary files
 *.tmp
+*.md
 *.bak
 *.swp
 *~
@@ -45,4 +46,3 @@ Thumbs.db
 
 # Docker
 .docker/
-CLAUDE.md
