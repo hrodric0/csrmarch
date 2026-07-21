@@ -14,11 +14,13 @@ RUN addgroup -S csmr && adduser -S csmr -G csmr
 # /config/composition/chaining-smr-composition.yaml for the Chaining PoC). This
 # avoids relying on a host bind-mount of the repo's csmr-declarative-api dir,
 # which Docker Desktop on macOS blocks for the /host_mnt path resolution.
-# The compose-flavored YAMLs (compose service names) are installed under the
-# base filenames the E2E tests reference.
+# For the bare-metal K3s deployment we bake the KUBERNETES-flavored YAMLs
+# (kube-DNS FQDNs like csmr-kvs-0.csmr-kvs.csmr-poc.svc.cluster.local:9090),
+# NOT the compose-flavored *-docker.yaml variants (which use compose service
+# names + the sidecar default port 9000).
 RUN mkdir -p /config/composition
-COPY csmr-declarative-api/full-csmr-composition-docker.yaml      /config/composition/full-csmr-composition.yaml
-COPY csmr-declarative-api/chaining-smr-composition-docker.yaml   /config/composition/chaining-smr-composition.yaml
+COPY csmr-declarative-api/full-csmr-composition.yaml      /config/composition/full-csmr-composition.yaml
+COPY csmr-declarative-api/chaining-smr-composition.yaml   /config/composition/chaining-smr-composition.yaml
 RUN chown -R csmr:csmr /config/composition
 
 USER csmr

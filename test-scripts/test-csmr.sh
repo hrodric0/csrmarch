@@ -1,5 +1,5 @@
 #!/bin/bash
-# Test script for CSMR Docker Compose deployment.
+# Test script for the CSMR bare-metal K3s cluster (pre-provisioned Terraform stack).
 #
 # Cold-start coordinator election (URingPaxos):
 # On a fresh start each ring must elect a coordinator before any proposal can be
@@ -28,7 +28,10 @@
 set -u
 set -o pipefail
 
-PROXY_URL="${PROXY_URL:-http://localhost:8080}"
+PROXY_URL="${PROXY_URL:-http://192.168.1.139:30080}"
+# kubectl config for the bare-metal K3s cluster (absolute path required; ~ fails).
+KUBECONFIG="${KUBECONFIG:-/Users/rwbonatto/csmr-k3s.yaml}"
+NAMESPACE="${NAMESPACE:-csmr-poc}"
 READY_TIMEOUT_SECONDS="${READY_TIMEOUT_SECONDS:-180}"
 READY_POLL_INTERVAL_SECONDS="${READY_POLL_INTERVAL_SECONDS:-3}"
 
@@ -44,18 +47,23 @@ send_command() {
 # starts its own CoordinatorRole once elected), so no external ZK orchestration
 # is performed here — readiness is gated solely on a functional proxy probe.
 bring_up_stack() {
-    echo "── Starting full CSMR stack ──────────────────────────────────────────"
-
-    echo "  tearing down any prior stack (clears stale ZK acceptor znodes)..."
-    docker compose down -v >/dev/null 2>&1
-
-    echo "  building and starting all services..."
-    if ! docker compose up -d --build; then
-        echo "✗ docker compose up failed."
+    # On the bare-metal K3s cluster the stack is pre-provisioned via Terraform;
+    # there is no docker compose to bring up here. We only verify the proxy is
+    # reachable. Set CSMR_SKIP_BRINGUP=0 only if you intend to assert that the
+    # stack is externally managed (the function then errors instead of assuming).
+    if [ "${CSMR_SKIP_BRINGUP:-1}" != "1" ]; then
+        echo "✗ bring_up_stack is only supported in Docker Compose mode."
+        echo "  The cluster stack must already be running (terraform apply)."
         return 1
     fi
-
-    echo "  ✓ stack started; gating traffic on a functional proxy probe."
+    echo "── Reusing pre-provisioned CSMR stack on K3s (CSMR_SKIP_BRINGUP=1) ──"
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" "$PROXY_URL/api/health" 2>/dev/null)
+    if [ "$code" != "200" ]; then
+        echo "✗ Proxy not reachable at $PROXY_URL (HTTP $code). Is the cluster up?"
+        return 1
+    fi
+    echo "  ✓ proxy reachable at $PROXY_URL"
     return 0
 }
 
@@ -78,8 +86,8 @@ probe_proxy_ready() {
     done
     echo "✗ Proxy could not order a command within ${READY_TIMEOUT_SECONDS}s."
     echo "  Inspect coordinator election with:"
-    echo "    docker compose logs sidecar-kvs-0 sidecar-log-0 | grep -i coordinator"
-    echo "    docker exec -it csmr-project-zookeeper-1 zookeeper-shell localhost:2181 ls /ringpaxos"
+    echo "    kubectl --kubeconfig=$KUBECONFIG -n $NAMESPACE get pods -l app=csmr-kvs"
+    echo "    kubectl --kubeconfig=$KUBECONFIG -n $NAMESPACE exec zookeeper-0 -c zookeeper -- zookeeper-shell localhost:2181 ls /ringpaxos"
     return 1
 }
 
@@ -123,9 +131,9 @@ else
 fi
 
 echo ""
-echo "=== System Status ==="
-docker compose ps | grep -E "(SERVICE|proxy|sidecar|zookeeper)" | head -20
+echo "=== CSMR System Status (K3s) ==="
+kubectl --kubeconfig="$KUBECONFIG" -n "$NAMESPACE" get pods -o wide 2>/dev/null | grep -E "(NAME|csmr-kvs|csmr-proxy|zookeeper)" | head -20
 
 echo ""
 echo "=== Test Complete ==="
-echo "CSMR system is working correctly in Docker Compose mode."
+echo "CSMR system is working correctly on the bare-metal K3s cluster."

@@ -22,25 +22,31 @@ terraform {
       source  = "hashicorp/kubernetes"
       version = "~> 2.27"
     }
-    helm = {
-      source  = "hashicorp/helm"
-      version = "~> 2.13"
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.11"
     }
   }
 }
 
 # ── Provider configuration ────────────────────────────────────────────────────
+# Point the provider at the bare-metal kubeconfig (a copy of vortex-0's
+# /home/hrodrich/.kube/config with `server:` rewritten to
+# https://192.168.1.139:6443). No config_context — the k3s kubeconfig has a
+# single context; leaving context unset uses the current-context.
+# `insecure = true` skips the self-signed K3s API-server cert verification
+# (the rewrite puts the LAN IP in the SAN list, so this is just belt-and-bris).
 
 provider "kubernetes" {
-  config_path = pathexpand("~/.kube/config")
-  config_context = "kind-csmr"
+  config_path = pathexpand(var.kubeconfig_path)
+  insecure    = true
 }
 
-provider "helm" {
-  kubernetes {
-    config_path = pathexpand("~/.kube/config")
-    config_context = "kind-csmr"
-  }
+locals {
+  # Bare metal has no registry: images are imported per-node via
+  # `k3s ctr images import`. With image_registry = "" we must NOT emit a leading
+  # slash, so compute the prefix once.
+  image_prefix = var.image_registry == "" ? "" : "${var.image_registry}/"
 }
 
 # ── Namespace ─────────────────────────────────────────────────────────────────
@@ -55,33 +61,155 @@ resource "kubernetes_namespace" "csmr_poc" {
   }
 }
 
-# ── ZooKeeper (StatefulSet via Helm) ──────────────────────────────────────────
+# ── ZooKeeper (in-cluster Pod, not Helm) ─────────────────────────────────────
 # ZooKeeper is the central coordination service for:
-#   - URingPaxos ring topology discovery (sidecars)
+#   - URingPaxos ring topology discovery (sidecars read /ringpaxos/topology<N>)
+#   - CSMR ring membership (/csmr/rings/<ringId>/members/<nodeId>)
 #   - Composition validation state (operator)
+#
+# For the bare-metal PoC we run ZooKeeper as a single-replica StatefulSet
+# using the confluentinc image (same image docker-compose uses, so the CLI
+# and env shape are identical). It is pinned to vortex-1 via the
+# `csmr-zookeeper=true` label that Ansible Phase 4 applied to that node.
+# Bare metal has no PVC story we trust, so we persist only to emptyDir.
 
-resource "helm_release" "zookeeper" {
-  name       = "zookeeper"
-  repository = "https://charts.bitnami.com/bitnami"
-  chart      = "zookeeper"
-  version    = "12.4.3"
-  namespace  = kubernetes_namespace.csmr_poc.metadata[0].name
+resource "kubernetes_stateful_set" "zookeeper" {
+  metadata {
+    name      = "zookeeper"
+    namespace = kubernetes_namespace.csmr_poc.metadata[0].name
+    labels    = { "app" = "zookeeper" }
+  }
 
-  set {
-    name  = "replicaCount"
-    value = var.zookeeper_replicas
+  spec {
+    service_name = kubernetes_service.zookeeper.metadata[0].name
+    replicas     = var.zookeeper_replicas
+
+    selector {
+      match_labels = { "app" = "zookeeper" }
+    }
+
+    template {
+      metadata {
+        labels = { "app" = "zookeeper" }
+      }
+
+      spec {
+        # Pin to the designated ZooKeeper host (Ansible labelled vortex-1).
+        node_selector = {
+          "csmr-zookeeper" = "true"
+        }
+
+        container {
+          name  = "zookeeper"
+          image = "${local.image_prefix}confluentinc/cp-zookeeper:7.6.0"
+          # Local images imported via `k3s ctr images import`; no pull attempt.
+          image_pull_policy = var.image_pull_policy
+
+          port {
+            container_port = 2181
+            name           = "client"
+          }
+          port {
+            container_port = 2888
+            name           = "server"
+          }
+          port {
+            container_port = 3888
+            name           = "leader-election"
+          }
+
+          env {
+            name  = "ZOOKEEPER_CLIENT_PORT"
+            value = "2181"
+          }
+          env {
+            name  = "ZOOKEEPER_TICK_TIME"
+            value = "2000"
+          }
+          # confluentinc/cp-zookeeper requires an explicit server id even for a
+          # single-replica ensemble; without it the entrypoint aborts with
+          # "ZOOKEEPER_SERVER_ID is required" and the pod CrashLoops.
+          env {
+            name  = "ZOOKEEPER_SERVER_ID"
+            value = "1"
+          }
+
+          # With a single replica the ensemble must not wait on peers.
+          env {
+            name  = "ZOOKEEPER_SERVERS"
+            value = "zookeeper:2888:3888"
+          }
+
+          liveness_probe {
+            tcp_socket {
+              port = 2181
+            }
+            initial_delay_seconds = 20
+            period_seconds        = 10
+          }
+
+          readiness_probe {
+            tcp_socket {
+              port = 2181
+            }
+            initial_delay_seconds = 10
+            period_seconds        = 10
+          }
+
+          # No durable claim in the PoC: ZK data lives on the node's ephemeral
+          # emptyDir. Ring topology is rebuilt by sidecars on restart.
+          volume_mount {
+            name       = "zk-data"
+            mount_path = "/var/lib/zookeeper/data"
+          }
+          volume_mount {
+            name       = "zk-log"
+            mount_path = "/var/lib/zookeeper/log"
+          }
+
+          resources {
+            requests = {
+              memory = "256Mi"
+              cpu    = "250m"
+            }
+            limits = {
+              memory = "512Mi"
+              cpu    = "500m"
+            }
+          }
+        }
+
+        volume {
+          name = "zk-data"
+          empty_dir {}
+        }
+        volume {
+          name = "zk-log"
+          empty_dir {}
+        }
+      }
+    }
   }
-  set {
-    name  = "persistence.enabled"
-    value = false
+
+  depends_on = [kubernetes_namespace.csmr_poc]
+}
+
+resource "kubernetes_service" "zookeeper" {
+  metadata {
+    name      = "zookeeper"
+    namespace = kubernetes_namespace.csmr_poc.metadata[0].name
+    labels    = { "app" = "zookeeper" }
   }
-  set {
-    name  = "resources.requests.memory"
-    value = "256Mi"
-  }
-  set {
-    name  = "resources.requests.cpu"
-    value = "100m"
+
+  spec {
+    cluster_ip = "None"
+    selector   = { "app" = "zookeeper" }
+
+    port {
+      name        = "client"
+      port        = 2181
+      target_port = 2181
+    }
   }
 
   depends_on = [kubernetes_namespace.csmr_poc]
@@ -93,6 +221,17 @@ resource "kubernetes_manifest" "csmr_crd" {
   manifest = yamldecode(file("${path.module}/../csmr-declarative-api/crd-csmrcomposition.yaml"))
 
   depends_on = [kubernetes_namespace.csmr_poc]
+}
+
+# The API server registers a newly-installed CRD asynchronously; the
+# `kubernetes_manifest` for the compositions below is rejected with
+# "no matches for kind CsmrComposition" if it lands before the CRD is
+# Established. Gate on a short sleep after the CRD so the new kind is
+# served before we create instances of it.
+resource "time_sleep" "wait_for_crd" {
+  create_duration = "30s"
+
+  depends_on = [kubernetes_manifest.csmr_crd]
 }
 
 # ── CSMR Control Plane (Operator / Checker) ───────────────────────────────────
@@ -118,8 +257,8 @@ resource "kubernetes_deployment" "control_plane" {
 
       spec {
         container {
-          name  = "operator"
-          image = "${var.image_registry}/csmr-control-plane:${var.image_tag}"
+          name              = "operator"
+          image             = "${local.image_prefix}csmr-control-plane:${var.image_tag}"
           image_pull_policy = var.image_pull_policy
 
           env {
@@ -144,7 +283,7 @@ resource "kubernetes_deployment" "control_plane" {
     }
   }
 
-  depends_on = [helm_release.zookeeper, kubernetes_manifest.csmr_crd]
+  depends_on = [kubernetes_stateful_set.zookeeper, kubernetes_manifest.csmr_crd]
 }
 
 # ── RBAC for the Operator ─────────────────────────────────────────────────────
@@ -218,9 +357,26 @@ resource "kubernetes_stateful_set" "proxy" {
       }
 
       spec {
+        # Pin the proxy to the master (vortex-0), which is the only node the
+        # laptop/benchmark client can reach on the LAN. The master is tainted
+        # by Ansible (control-plane role), so we tolerate it and target it.
+        toleration {
+          key      = "node-role.kubernetes.io/control-plane"
+          operator = "Exists"
+          effect   = "NoSchedule"
+        }
+        toleration {
+          key      = "node-role.kubernetes.io/master"
+          operator = "Exists"
+          effect   = "NoSchedule"
+        }
+        node_selector = {
+          "csmr-role" = "proxy"
+        }
+
         container {
-          name  = "proxy"
-          image = "${var.image_registry}/csmr-proxy:${var.image_tag}"
+          name              = "proxy"
+          image             = "${local.image_prefix}csmr-proxy:${var.image_tag}"
           image_pull_policy = var.image_pull_policy
 
           port {
@@ -231,6 +387,15 @@ resource "kubernetes_stateful_set" "proxy" {
           env {
             name  = "ZOOKEEPER_CONNECT"
             value = "zookeeper.${var.namespace}.svc.cluster.local:2181"
+          }
+
+          # Point the proxy at the bundled kube-DNS composition (the image
+          # bakes full-csmr-composition.yaml into /config/composition, see
+          # docker/Dockerfile.proxy). This routes to sidecars via
+          # <app>-<ord>.<app>.<ns>.svc.cluster.local:<sidecarPort>.
+          env {
+            name  = "CSMR_ROUTING_YAML_PATH"
+            value = "/config/composition/full-csmr-composition.yaml"
           }
 
           # Proxy ID from pod ordinal for leader election
@@ -276,7 +441,7 @@ resource "kubernetes_stateful_set" "proxy" {
     }
   }
 
-  depends_on = [helm_release.zookeeper, kubernetes_deployment.control_plane]
+  depends_on = [kubernetes_stateful_set.zookeeper, kubernetes_deployment.control_plane]
 }
 
 # Headless service for inter-proxy communication
@@ -297,7 +462,10 @@ resource "kubernetes_service" "proxy_headless" {
     }
   }
 
-  depends_on = [kubernetes_stateful_set.proxy]
+  # NOTE: no depends_on on the StatefulSet — that would create a cycle
+  # (the StatefulSet reads this service's name via service_name). K8s has no
+  # ordering requirement between a headless Service and the StatefulSet it
+  # backs.
 }
 
 # NodePort service for client access (load balanced across all proxy replicas)
@@ -333,20 +501,21 @@ module "lockservice" {
     kubernetes = kubernetes
   }
 
-  namespace         = var.namespace
-  app_name          = "csmr-lockservice"
-  replicas          = var.lock_replicas
-  app_image         = "${var.image_registry}/csmr-app-lockservice:${var.image_tag}"
-  sidecar_image     = "${var.image_registry}/csmr-sidecar-paxos:${var.image_tag}"
-  image_pull_policy = var.image_pull_policy
-  app_port          = 8083
-  sidecar_port      = 9092
-  ring_id_prefix    = "lock_service"
-  zk_connect        = "zookeeper.${var.namespace}.svc.cluster.local:2181"
+  namespace           = var.namespace
+  app_name            = "csmr-lock"
+  replicas            = var.lock_replicas
+  app_image           = "${local.image_prefix}csmr-app-lockservice:${var.image_tag}"
+  sidecar_image       = "${local.image_prefix}csmr-sidecar-paxos:${var.image_tag}"
+  image_pull_policy   = var.image_pull_policy
+  app_port            = 8081
+  sidecar_port        = 9092
+  ring_id_prefix      = "lock_service"
+  ring_id_numeric     = "7"
+  zk_connect          = "zookeeper.${var.namespace}.svc.cluster.local:2181"
   stable_storage_type = "InMemory"
   stable_storage_size = "1Gi"
 
-  depends_on = [helm_release.zookeeper, kubernetes_deployment.control_plane]
+  depends_on = [kubernetes_stateful_set.zookeeper, kubernetes_deployment.control_plane]
 }
 
 # ── KVS StatefulSet ───────────────────────────────────────────────────────────
@@ -358,20 +527,21 @@ module "kvs" {
     kubernetes = kubernetes
   }
 
-  namespace         = var.namespace
-  app_name          = "csmr-kvs"
-  replicas          = var.kvs_replicas
-  app_image         = "${var.image_registry}/csmr-app-kvs:${var.image_tag}"
-  sidecar_image     = "${var.image_registry}/csmr-sidecar-paxos:${var.image_tag}"
-  image_pull_policy = var.image_pull_policy
-  app_port          = 8081
-  sidecar_port      = 9090
-  ring_id_prefix    = "kv_store"
-  zk_connect        = "zookeeper.${var.namespace}.svc.cluster.local:2181"
+  namespace           = var.namespace
+  app_name            = "csmr-kvs"
+  replicas            = var.kvs_replicas
+  app_image           = "${local.image_prefix}csmr-app-kvs:${var.image_tag}"
+  sidecar_image       = "${local.image_prefix}csmr-sidecar-paxos:${var.image_tag}"
+  image_pull_policy   = var.image_pull_policy
+  app_port            = 8081
+  sidecar_port        = 9090
+  ring_id_prefix      = "kv_store_Put"
+  ring_id_numeric     = "1"
+  zk_connect          = "zookeeper.${var.namespace}.svc.cluster.local:2181"
   stable_storage_type = "InMemory"
   stable_storage_size = "1Gi"
 
-  depends_on = [helm_release.zookeeper, kubernetes_deployment.control_plane]
+  depends_on = [kubernetes_stateful_set.zookeeper, kubernetes_deployment.control_plane]
 }
 
 # ── Log StatefulSet ───────────────────────────────────────────────────────────
@@ -383,20 +553,21 @@ module "log" {
     kubernetes = kubernetes
   }
 
-  namespace         = var.namespace
-  app_name          = "csmr-log"
-  replicas          = var.log_replicas
-  app_image         = "${var.image_registry}/csmr-app-log:${var.image_tag}"
-  sidecar_image     = "${var.image_registry}/csmr-sidecar-paxos:${var.image_tag}"
-  image_pull_policy = var.image_pull_policy
-  app_port          = 8082
-  sidecar_port      = 9091
-  ring_id_prefix    = "logger"
-  zk_connect        = "zookeeper.${var.namespace}.svc.cluster.local:2181"
-  stable_storage_type = "SyncBerkeley"
+  namespace           = var.namespace
+  app_name            = "csmr-log"
+  replicas            = var.log_replicas
+  app_image           = "${local.image_prefix}csmr-app-log:${var.image_tag}"
+  sidecar_image       = "${local.image_prefix}csmr-sidecar-paxos:${var.image_tag}"
+  image_pull_policy   = var.image_pull_policy
+  app_port            = 8082
+  sidecar_port        = 9091
+  ring_id_prefix      = "logger_Append"
+  ring_id_numeric     = "2"
+  zk_connect          = "zookeeper.${var.namespace}.svc.cluster.local:2181"
+  stable_storage_type = "InMemory"
   stable_storage_size = "2Gi"
 
-  depends_on = [helm_release.zookeeper, kubernetes_deployment.control_plane]
+  depends_on = [kubernetes_stateful_set.zookeeper, kubernetes_deployment.control_plane]
 }
 
 # ── Apply the composition manifest ────────────────────────────────────────────
@@ -405,7 +576,7 @@ resource "kubernetes_manifest" "composition" {
   manifest = yamldecode(file("${path.module}/../csmr-declarative-api/csmr-composition.yaml"))
 
   depends_on = [
-    kubernetes_manifest.csmr_crd,
+    time_sleep.wait_for_crd,
     kubernetes_deployment.control_plane,
     module.kvs,
     module.log,
@@ -418,7 +589,7 @@ resource "kubernetes_manifest" "chaining_composition" {
   manifest = yamldecode(file("${path.module}/../csmr-declarative-api/chaining-smr-composition.yaml"))
 
   depends_on = [
-    kubernetes_manifest.csmr_crd,
+    time_sleep.wait_for_crd,
     kubernetes_deployment.control_plane,
     kubernetes_stateful_set.proxy
   ]

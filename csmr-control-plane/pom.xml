@@ -46,6 +46,20 @@
             <groupId>com.fasterxml.jackson.dataformat</groupId>
             <artifactId>jackson-dataformat-yaml</artifactId>
         </dependency>
+        <!-- Pin jackson-core to match jackson-databind (2.17.0). Without an
+             explicit version the operator-framework brings an older jackson-core
+             onto the assembly classpath, which lacks BufferRecycler.releaseToPool()
+             (added in 2.15) and crashes the informer with NoSuchMethodError. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>

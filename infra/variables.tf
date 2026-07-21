@@ -5,15 +5,9 @@
 # ── Kubernetes cluster ────────────────────────────────────────────────────────
 
 variable "kubeconfig_path" {
-  description = "Path to the kubeconfig file for the target cluster."
+  description = "Path to the kubeconfig for the bare-metal K3s cluster. Use the rewritten copy of vortex-0's /home/hrodrich/.kube/config with server set to https://192.168.1.139:6443 (the laptop can't reach 127.0.0.1 on the master). See infra/scripts/rewrite-kubeconfig.sh."
   type        = string
-  default     = "~/.kube/config"
-}
-
-variable "kube_context" {
-  description = "Kubernetes context to use (e.g. 'minikube' or 'localstack')."
-  type        = string
-  default     = "minikube"
+  default     = "~/csmr-k3s.yaml"
 }
 
 variable "namespace" {
@@ -23,11 +17,14 @@ variable "namespace" {
 }
 
 # ── Container images ──────────────────────────────────────────────────────────
+# Bare metal: no registry. Images are imported on each node via
+# `k3s ctr images import` (see infra/scripts/build-and-distribute-images.sh), so
+# the registry prefix is empty and imagePullPolicy is Never.
 
 variable "image_registry" {
-  description = "Container image registry prefix (e.g. 'localhost:5000' for Minikube local registry)."
+  description = "Container image registry prefix. Empty string for bare metal (images imported locally via 'k3s ctr images import'); set to e.g. localhost:5000 only for a local-registry setup."
   type        = string
-  default     = "localhost:5000"
+  default     = ""
 }
 
 variable "image_tag" {
@@ -37,9 +34,9 @@ variable "image_tag" {
 }
 
 variable "image_pull_policy" {
-  description = "Kubernetes imagePullPolicy (Never for local images, Always for remote)."
+  description = "Kubernetes imagePullPolicy (IfNotPresent for locally imported images, Always for remote)."
   type        = string
-  default     = "Never"
+  default     = "IfNotPresent"
 
   validation {
     condition     = contains(["Always", "Never", "IfNotPresent"], var.image_pull_policy)
@@ -76,6 +73,29 @@ variable "lock_replicas" {
   description = "Number of Lock Service pod replicas (must be >= f+1 = 2 for the PoC)."
   type        = number
   default     = 3
+}
+
+variable "prng_replicas" {
+  description = "Number of PRNG Service pod replicas (must be >= f+1 = 2 for the PoC)."
+  type        = number
+  default     = 3
+}
+
+variable "counter_replicas" {
+  description = "Number of Counter Service pod replicas (must be >= f+1 = 2 for the PoC)."
+  type        = number
+  default     = 3
+}
+
+# ── ZooKeeper placement ──────────────────────────────────────────────────────
+# The Phase-4 topology labels put `csmr-zookeeper=true` on vortex-1, so we pin
+# the (in-cluster) ZooKeeper StatefulSet there to honor that label rather than
+# let the scheduler place it arbitrarily.
+
+variable "zk_node_selector_label" {
+  description = "Node label that pins ZooKeeper to the designated ZooKeeper host (vortex-1)."
+  type        = string
+  default     = "csmr-zookeeper=true"
 }
 
 variable "proxy_replicas" {

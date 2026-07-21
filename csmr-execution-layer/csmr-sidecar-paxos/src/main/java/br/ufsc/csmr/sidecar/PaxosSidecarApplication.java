@@ -50,7 +50,7 @@ public class PaxosSidecarApplication {
         Integer ringIdNumeric = ringIdNumericStr != null && !ringIdNumericStr.isBlank()
                 ? Integer.parseInt(ringIdNumericStr)
                 : null;
-        int    nodeId    = Integer.parseInt(System.getenv().getOrDefault("NODE_ID", "0"));
+        int    nodeId    = parseNodeId(System.getenv("NODE_ID"), 0);
         int    appPort   = Integer.parseInt(System.getenv().getOrDefault("APP_PORT", "8081"));
 
         log.info("Initializing CSMR Paxos Sidecar — ring='{}' nodeId={} zkConnect='{}'",
@@ -81,5 +81,33 @@ public class PaxosSidecarApplication {
 
         log.info("Sidecar '{}' node {} is ready.", ringId, nodeId);
         return node;
+    }
+
+    /**
+     * Resolves the Paxos acceptor id from the NODE_ID env var.
+     *
+     * In docker-compose NODE_ID is already numeric ("0"/"1"/"2"). In
+     * Kubernetes we wire it from the pod name (metadata.name, e.g.
+     * "csmr-kvs-0"), so fall back to the trailing numeric ordinal of that
+     * name — Integer.parseInt would otherwise throw NumberFormatException on
+     * the StatefulSet pod name and wedge every ring on cold start.
+     */
+    private static int parseNodeId(String raw, int fallback) {
+        if (raw == null || raw.isBlank()) {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            int dash = raw.lastIndexOf('-');
+            if (dash >= 0 && dash < raw.length() - 1) {
+                try {
+                    return Integer.parseInt(raw.substring(dash + 1).trim());
+                } catch (NumberFormatException ignored) {
+                    // fall through to fallback below
+                }
+            }
+            return fallback;
+        }
     }
 }

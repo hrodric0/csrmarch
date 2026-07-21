@@ -18,16 +18,17 @@ terraform {
   }
 }
 
-variable "namespace"         { type = string }
-variable "app_name"          { type = string }
-variable "replicas"          { type = number }
-variable "app_image"         { type = string }
-variable "sidecar_image"     { type = string }
+variable "namespace" { type = string }
+variable "app_name" { type = string }
+variable "replicas" { type = number }
+variable "app_image" { type = string }
+variable "sidecar_image" { type = string }
 variable "image_pull_policy" { type = string }
-variable "app_port"          { type = number }
-variable "sidecar_port"      { type = number }
-variable "ring_id_prefix"    { type = string }
-variable "zk_connect"        { type = string }
+variable "app_port" { type = number }
+variable "sidecar_port" { type = number }
+variable "ring_id_prefix" { type = string }
+variable "ring_id_numeric" { type = string } # numeric topology<N> selector for URingPaxos
+variable "zk_connect" { type = string }
 
 # Constraint #4: StableStorage configuration
 variable "stable_storage_type" {
@@ -88,9 +89,9 @@ resource "kubernetes_persistent_volume_claim" "stable_storage" {
       }
     }
 
-    # Use a storage class that provides persistent storage
-    # In Minikube, the standard storage class works
-    storage_class_name = "standard"
+    # Use a storage class that provides persistent storage.
+    # K3s ships "local-path"; Minikube uses "standard". Bare metal = local-path.
+    storage_class_name = "local-path"
   }
 }
 
@@ -117,6 +118,33 @@ resource "kubernetes_stateful_set" "app" {
       }
 
       spec {
+        # subdomain makes each StatefulSet pod reachable as
+        # <app>-<ordinal>.<app>.<namespace>.svc.cluster.local — the address the
+        # sidecar publishes to ZooKeeper as its ring-peer endpoint. The pod
+        # hostname is already its name (csmr-kvs-0) via the StatefulSet; only the
+        # subdomain needs setting so the headless service answers, otherwise peers
+        # can't federate the Paxos ring.
+        subdomain = var.app_name
+
+        # Spread the replicas across distinct nodes (vortex-1/2/3 are the Paxos
+        # replicas) so a single physical host loss can't take down a whole ring.
+        affinity {
+          pod_anti_affinity {
+            preferred_during_scheduling_ignored_during_execution {
+              weight = 100
+              pod_affinity_term {
+                topology_key = "kubernetes.io/hostname"
+                label_selector {
+                  match_expressions {
+                    key      = "app"
+                    operator = "In"
+                    values   = [var.app_name]
+                  }
+                }
+              }
+            }
+          }
+        }
 
         # ── Application container (KVS or Log) ──────────────────────────────
         container {
@@ -174,9 +202,17 @@ resource "kubernetes_stateful_set" "app" {
           }
 
           env {
-            name  = "RING_ID"
+            name = "RING_ID"
             # Each pod gets a unique ring ID: e.g. "kv_store_Put_0", "kv_store_Put_1"
-            value = "${var.ring_id_prefix}"
+            value = var.ring_id_prefix
+          }
+
+          # Numeric ring id selects the URingPaxos topology<N> tree in ZooKeeper.
+          # Drives coordinator election; omitting it drops the ring onto a
+          # degraded fallback path (PaxosSidecarApplication.java).
+          env {
+            name  = "RING_ID_NUMERIC"
+            value = var.ring_id_numeric
           }
 
           # NODE_ID from the pod ordinal via the Downward API
@@ -192,6 +228,16 @@ resource "kubernetes_stateful_set" "app" {
           env {
             name  = "APP_PORT"
             value = tostring(var.app_port)
+          }
+
+          # SERVER_PORT is the sidecar's own REST listener (the port the proxy
+          # proposes to). The module passes the per-ring sidecar port
+          # (9090/9091/9092); without this the Dockerfile default 9000 would be
+          # used and the proxy's kube-DNS addresses (…:9090) would get
+          # connection-refused. Spring Boot picks SERVER_PORT up automatically.
+          env {
+            name  = "SERVER_PORT"
+            value = tostring(var.sidecar_port)
           }
 
           # Constraint #4: StableStorage configuration
@@ -222,11 +268,11 @@ resource "kubernetes_stateful_set" "app" {
 
           resources {
             requests = {
-              memory = "128Mi"
+              memory = "256Mi"
               cpu    = "100m"
             }
             limits = {
-              memory = "256Mi"
+              memory = "512Mi"
               cpu    = "500m"
             }
           }

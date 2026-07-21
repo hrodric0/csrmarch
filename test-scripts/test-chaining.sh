@@ -2,8 +2,8 @@
 # =============================================================================
 # test-chaining.sh — E2E for the Chaining SMR PoC (Alves 2026, Future Work)
 #
-# Brings up the full CSMR Docker Compose stack with the proxy pointed at
-# csmr-declarative-api/chaining-smr-composition.yaml, then exercises the
+# Runs against the bare-metal K3s cluster (pre-provisioned via Terraform). The
+# proxy is baked with the chaining composition; this script exercises the
 # `init_counter` chaining rule:
 #
 #     stage 1: prng_service.Generate(min,max)  → result = deterministic number
@@ -18,9 +18,12 @@
 #   bash test-scripts/test-chaining.sh
 #
 # Prereqs:
-#   - Docker + docker compose
-#   - mvn-built JARs (run `mvn clean package -DskipTests` first)
-#   - URingPaxos installed in ~/.m2
+#   - The bare-metal K3s CSMR stack up (terraform apply) and reachable.
+#   - kubectl with access to the cluster (KUBECONFIG defaults to the
+#     bare-metal kubeconfig; ~ expansion fails, so use an absolute path).
+#   - Chaining rings (prng_service / counter_service) deployed IF you want the
+#     chaining assertions to run. On the default 3-ring Terraform deployment
+#     they are NOT present, so this test detects that and SKIPs.
 # =============================================================================
 
 set -uo pipefail
@@ -30,8 +33,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_FILE="${SCRIPT_DIR}/../test-logs/chaining-test.log"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-PROXY_URL="http://localhost:8080"
-FULL_CHAIN_YAML="/config/composition/chaining-smr-composition.yaml"
+PROXY_URL="${PROXY_URL:-http://192.168.1.139:30080}"
+# kubectl config for the bare-metal K3s cluster (absolute path required; ~ fails).
+KUBECONFIG="${KUBECONFIG:-/Users/rwbonatto/csmr-k3s.yaml}"
+NAMESPACE="${NAMESPACE:-csmr-poc}"
+# On the bare-metal cluster the proxy is baked with full-csmr-composition.yaml
+# (which does NOT include the chaining rings prng_service/counter_service). The
+# chaining exerciser runs only when those rings are deployed.
+CHAIN_YAML="/config/composition/chaining-smr-composition.yaml"
 
 # Counters
 TESTS_RUN=0
@@ -95,25 +104,24 @@ probe_proxy_ready() {
     return 1
 }
 
-# Wait until the proxy serves /api/health UP, OR until a probe command returns a
-# top-level "result" (meaning every targeted ring has a coordinator and is
-# ordering proposals). Bounded by MAX_WAIT.
+# Wait until the proxy serves /api/health UP AND a functional probe command
+# returns a top-level "result" (meaning the targeted ring has a coordinator and
+# is ordering proposals). On the default cluster the prng/counter chaining rings
+# are NOT deployed, so the readiness probe uses a plain `put` (kv_store ring),
+# which is always present. Bounded by MAX_WAIT.
 wait_for_ready() {
     local max_wait="${1:-300}"
     local interval=5
     local elapsed=0
-    log "Waiting for CSMR stack readiness (proxy + targeted rings)..."
+    log "Waiting for CSMR stack readiness (proxy + kv_store ring)..."
     while [ "$elapsed" -lt "$max_wait" ]; do
         if probe_proxy_ready; then
-            # Proxy is up; also confirm a functional probe command (init_counter
-            # exercises prng_service + counter_service) actually orders.
+            # Generic readiness probe: a put orders through the always-present
+            # kv_store ring (top-level "result" => a coordinator is elected).
             local probe
-            probe=$(send_command '{"id":9001,"method":"init_counter","params":{"min":"0","max":"100"}}')
-            # The proxy wraps the chain under a top-level "result" STRINGIFIED JSON
-            # object, so the raw body encodes the chain as \"chain\" (escaped). Unwrap
-            # .result first, then match the literal "chain".
-            if echo "$probe" | jq -r '.result // empty' 2>/dev/null | grep -qE '"chain"'; then
-                log "Stack ready (chained probe returned intermediate results)."
+            probe=$(send_command '{"id":9001,"method":"put","params":{"key":"__readiness_probe__","value":"ready"}}')
+            if echo "$probe" | jq -r '.result // empty' 2>/dev/null | grep -qE '"status"[^,]*"decided"'; then
+                log "Stack ready (probe returned decided result)."
                 return 0
             fi
             # The proxy may be up while a ring has no coordinator yet; keep waiting.
@@ -127,35 +135,60 @@ wait_for_ready() {
     return 1
 }
 
+# ── Chaining-ring availability ───────────────────────────────────────────────
+# The bare-metal Terraform deploys only kv_store / logger / lock_service rings.
+# The chaining PoC requires the prng_service + counter_service rings
+# (csmr-prng-0..2 / csmr-counter-0..2), which are NOT part of that deployment.
+# Detect their presence via kubectl before running any chaining assertion so the
+# test SKIPs cleanly instead of failing (or pretending to pass).
+detect_chaining_available() {
+    if ! kubectl --kubeconfig="$KUBECONFIG" -n "$NAMESPACE" get pod csmr-prng-0 --no-headers >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! kubectl --kubeconfig="$KUBECONFIG" -n "$NAMESPACE" get pod csmr-counter-0 --no-headers >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
 # ── Stack lifecycle ──────────────────────────────────────────────────────────
 bring_up_stack() {
     local routing_yaml="${1:-}"
-    local export_line=""
     if [ -n "$routing_yaml" ]; then
-        export_line="CSMR_ROUTING_YAML_PATH=$routing_yaml"
-        log_detail "Proxy will load composition: $routing_yaml"
+        log_detail "Chaining composition requested: $routing_yaml"
     fi
 
-    # Guard: reuse an already-provisioned, correctly-configured live stack
-    # (proxy already pointed at the chaining composition) and skip the
-    # `up --build` bring-up. Set CSMR_SKIP_BRINGUP=1.
-    if [ "${CSMR_SKIP_BRINGUP:-}" = "1" ]; then
-        log_section "Reusing existing CSMR stack (CSMR_SKIP_BRINGUP=1)"
-        log_detail "Skipping docker compose up --build."
+    # Guard: reuse an already-provisioned, live stack (the Terraform deployment,
+    # or a docker-compose run that already has the chaining rings). Set
+    # CSMR_SKIP_BRINGUP=0 to enforce a docker-compose bring-up instead.
+    if [ "${CSMR_SKIP_BRINGUP:-1}" != "1" ]; then
+        log_section "Bringing up CSMR stack via docker compose (chaining composition)"
+        cd "$PROJECT_DIR" || { log_result "FAIL" "Cannot cd to $PROJECT_DIR"; exit 1; }
+        if ! docker compose up -d --build 2>&1 | grep -E "(Building|Creating|Starting|Healthy)" | head -20 >> "$LOG_FILE"; then
+            log_result "FAIL" "docker compose up failed"
+            return 1
+        fi
+        log "Stack services started."
         return 0
     fi
 
-    log_section "Bringing up CSMR stack (chaining composition)"
-    cd "$PROJECT_DIR" || { log_result "FAIL" "Cannot cd to $PROJECT_DIR"; exit 1; }
-
-    if ! env $export_line docker compose up -d --build 2>&1 | grep -E "(Building|Creating|Starting|Healthy)" | head -20 >> "$LOG_FILE"; then
-        log_result "FAIL" "docker compose up failed"
+    log_section "Reusing existing CSMR stack (CSMR_SKIP_BRINGUP=1)"
+    log_detail "Skipping docker compose up --build; verifying proxy reachability."
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" "$PROXY_URL/api/health" 2>/dev/null)
+    if [ "$code" != "200" ]; then
+        log_result "FAIL" "Proxy not reachable at $PROXY_URL (HTTP $code). Is the cluster/stack up?"
         return 1
     fi
-    log "Stack services started."
+    log_detail "Proxy reachable at $PROXY_URL."
+    return 0
 }
 
 tear_down_stack() {
+    if [ "${CSMR_SKIP_BRINGUP:-1}" = "1" ]; then
+        log_section "Leaving pre-provisioned stack running (CSMR_SKIP_BRINGUP=1)"
+        return 0
+    fi
     log_section "Tearing down CSMR stack"
     cd "$PROJECT_DIR" || return 0
     docker compose down -v >> "$LOG_FILE" 2>&1 || true
@@ -249,9 +282,24 @@ main() {
     log_section "CSMR Chaining PoC — E2E Test Suite"
     log "Log file: $LOG_FILE"
 
-    if ! bring_up_stack "$FULL_CHAIN_YAML"; then
+    if ! bring_up_stack "$CHAIN_YAML"; then
         log_result "FAIL" "Stack startup failed. Aborting."
         exit 1
+    fi
+
+    # The chaining PoC requires the prng_service + counter_service rings, which
+    # are absent from the 3-ring bare-metal Terraform deployment. If they aren't
+    # running, SKIP cleanly rather than failing (or faking a pass).
+    if ! detect_chaining_available; then
+        log_section "Chaining PoC — SKIPPED"
+        log_detail "prng_service / counter_service rings are not deployed on this cluster."
+        log_detail "The bare-metal Terraform runs only kv_store / logger / lock_service."
+        log_detail "To run the chaining PoC, deploy the chaining rings (csmr-prng / csmr-counter)"
+        log_detail "or execute this script against the docker-compose chaining stack with"
+        log_detail "CSMR_SKIP_BRINGUP=0."
+        print_summary
+        log "CSMR Chaining PoC E2E skipped (rings unavailable)."
+        exit 0
     fi
 
     if ! wait_for_ready 300; then

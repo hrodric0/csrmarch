@@ -1,0 +1,282 @@
+#!/usr/bin/env ansible-playbook
+#
+# CSMR Bare-Metal Provisioning — K3s on 4 physical Ubuntu Server machines
+# =====================================================================
+# Purpose:
+#   Bootstrap a single-master K3s cluster on the home-lab hardware described
+#   in hosts.ini, then label the nodes to encode the CSMR Multi-Ring Paxos
+#   topology used for the performance evaluation.
+#
+# SMR topology encoded here (see CLAUDE.md for the formal model):
+#   Formal invariant:   ∀ x ∈ O : |R(x)| ≥ f + 1
+#   Composition:        R = R₁ ∪ R₂ ,  f = min(f₁, f₂) = 1
+#   => every Paxos ring needs >= 2 active replicas to stay available.
+#
+#   vortex-0 : K3s master + proxy + load-generator (NOT a Paxos replica, so
+#              it can never dilute a ring's |R(x)| >= 2 quorum or skew the
+#              latency numbers it measures).
+#   vortex-1 : Replica 0  (lowest Paxos acceptor id -> coordinator) + ZooKeeper
+#   vortex-2 : Replica 1  (follower)
+#   vortex-3 : Replica 2  (follower)
+#
+# Run (first time, sudo is still password-protected + requiretty is set):
+#   ansible-playbook -i hosts.ini setup-csmr-cluster.yml --ask-become-pass \
+#     -e 'ansible_ssh_common_args=-tt -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null'
+#   (-tt forces a PTY so sudo's requiretty is satisfied while the bootstrap
+#    installs NOPASSWD + strips requiretty). The Phase 1 tasks self-heal sudo,
+#    so every later run needs no password and no -tt:
+#   ansible-playbook -i hosts.ini setup-csmr-cluster.yml
+#
+# Notes:
+#   * 'hrodrich' ends up with passwordless sudo, so 'become: yes' needs no password.
+#   * Re-running is safe/idempotent: the K3s install script detects an
+#     existing install, node labels use --overwrite, and apt is a no-op.
+# ---
+
+- name: Phase 1 - Common OS preparation for ALL nodes
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tasks:
+
+    - name: Create NOPASSWD sudoers drop-in (/etc/sudoers.d/hrodrich, mode 0440, visudo-validated)
+      copy:
+        content: "hrodrich ALL=(ALL:ALL) NOPASSWD:ALL\n"
+        dest: /etc/sudoers.d/hrodrich
+        owner: root
+        group: root
+        mode: '0440'
+        validate: '/usr/sbin/visudo -cf %s'
+      # Automated equivalent of:
+      #   sudo visudo -f /etc/sudoers.d/hrodrich   (+ "hrodrich ALL=(ALL:ALL) NOPASSWD:ALL")
+      #   sudo chmod 440 /etc/sudoers.d/hrodrich
+      # This makes hrodrich's sudo passwordless so Ansible (and every later
+      # task in this run and all future runs) needs no password -- matching the
+      # cluster's provisioning intent. The visudo validate avoids bricking sudo.
+      # Resolves "sudo: interactive authentication is required" when sudoers
+      # lacks NOPASSWD. This task itself escalates via the password you supply
+      # on the first run (--ask-become-pass); once written, every later task in
+      # this run and all future runs are passwordless, matching the cluster's
+      # provisioning intent. The visudo validate avoids bricking sudo.
+
+    - name: Remove "Defaults requiretty" so passwordless sudo works without a TTY
+      shell: |
+        if grep -rIl 'requiretty' /etc/sudoers /etc/sudoers.d 2>/dev/null; then
+          sed -i -E 's/^([[:space:]]*Defaults.*requiretty)/# \1/' /etc/sudoers /etc/sudoers.d/* 2>/dev/null
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+      # Ubuntu cloud images often ship "Defaults requiretty", which makes sudo
+      # demand a real terminal. That breaks Ansible's password become (it pipes
+      # the password with no TTY) and even "ssh host 'sudo ...'". Commenting it
+      # out (idempotent, in-place, across /etc/sudoers + sudoers.d) lets the
+      # NOPASSWD rule from the previous task take effect without needing -tt.
+
+    - name: Update APT cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install essential packages (curl, wget, jq, git, net-tools, htop, unzip)
+      apt:
+        name:
+          - curl
+          - wget
+          - jq
+          - git
+          - net-tools
+          - htop
+          - unzip
+        state: present
+
+    - name: Disable UFW firewall (URingPaxos uses TCP unicast between ring members)
+      ufw:
+        state: disabled
+      # URingPaxos opens many ephemeral acceptor/learner connections; on a
+      # trusted LAN we disable UFW rather than maintain a port allowlist that
+      # would silently break ring discovery if a port were missed.
+
+    - name: Enable IPv4 forwarding (required for pod/service networking)
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+        reload: yes
+        sysctl_set: yes
+
+    - name: Disable SWAP at runtime (kubelet requires swap off)
+      command: swapoff -a
+      when: ansible_facts['swaptotal_mb'] > 0
+      changed_when: false
+
+    - name: Disable SWAP permanently by commenting swap entries in /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+        backup: yes
+
+
+- name: Phase 2 - Install K3s server on the master and capture the node token
+  hosts: k3s_master
+  become: yes
+  gather_facts: yes
+  tasks:
+
+    - name: Install K3s server (official curl installer)
+      # The install script is idempotent: if K3s is already present it returns
+      # without re-provisioning. We omit Traefik to keep the control plane lean
+      # and reduce variance in the performance benchmarks (the CSMR proxy is
+      # exposed via NodePort per CLAUDE.md, so an ingress controller is unused).
+      shell: |
+        curl -sfL https://get.k3s.io | sh -s - server \
+          --disable=traefik \
+          --write-kubeconfig-mode=644
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Enable and start the k3s service
+      systemd:
+        name: k3s
+        enabled: yes
+        state: started
+
+    - name: Wait for the K3s API server to come up
+      wait_for:
+        host: 127.0.0.1
+        port: 6443
+        timeout: 120
+
+    - name: Slurp the K3s node-token (used by workers to join the cluster)
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: _node_token_raw
+
+    - name: Store the node-token as a fact for the workers to consume
+      set_fact:
+        node_token: "{{ _node_token_raw.content | b64decode | trim }}"
+      # Exposed to workers via hostvars['vortex-0']['node_token'].
+
+    - name: Ensure ~/.kube exists for the non-root user (hrodrich)
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0700'
+
+    - name: Copy the admin kubeconfig so hrodrich can run kubectl without sudo
+      copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+      # k3s.yaml points at 127.0.0.1:6443, valid from the master itself.
+
+    - name: Export KUBECONFIG for hrodrich login shells
+      copy:
+        content: 'export KUBECONFIG=$HOME/.kube/config'
+        dest: "/home/{{ ansible_user }}/.kube/kube-env.sh"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+
+
+- name: Phase 3 - Join worker nodes to the K3s cluster
+  hosts: k3s_workers
+  become: yes
+  gather_facts: yes
+  tasks:
+
+    - name: Install K3s agent and join the master using the shared node-token
+      shell: |
+        curl -sfL https://get.k3s.io | sh -s - agent \
+          --server https://{{ hostvars[groups['k3s_master'][0]]['ansible_host'] }}:6443 \
+          --token {{ hostvars[groups['k3s_master'][0]]['node_token'] }} \
+          --node-label csmr.cluster/csmr-joined=true
+      args:
+        creates: /etc/systemd/system/k3s-agent.service
+      # --node-label here is only a marker that the node was onboarded by this
+      # playbook; the authoritative CSMR topology labels are applied in Phase 4.
+
+    - name: Enable and start the k3s-agent service
+      systemd:
+        name: k3s-agent
+        enabled: yes
+        state: started
+
+
+- name: Phase 4 - Wait for Ready nodes and apply CSMR topology labels
+  hosts: k3s_master
+  become: yes
+  become_user: "{{ ansible_user }}"   # run kubectl as hrodrich (the kubeconfig owner)
+  gather_facts: no
+  vars:
+    # CSMR Multi-Ring Paxos topology. f = 1 => each ring must have >= 2
+    # replicas. The three worker nodes (vortex-1/2/3) carry the Paxos replicas;
+    # the master (vortex-0) stays a pure proxy/load-gen outside every quorum.
+    csmr_labels:
+      vortex-0:
+        - csmr-role=proxy
+      vortex-1:
+        - csmr-role=replica0
+        - csmr-zookeeper=true          # ZooKeeper co-located on the coordinator node
+      vortex-2:
+        - csmr-role=replica1
+      vortex-3:
+        - csmr-role=replica2
+  tasks:
+
+    - name: Wait until every node reports Ready (bounded timeout)
+      command: kubectl wait --for=condition=Ready --all nodes --timeout=300s
+      environment:
+        KUBECONFIG: "/home/{{ ansible_user }}/.kube/config"
+      register: _wait_result
+      until: _wait_result.rc == 0
+      retries: 6
+      delay: 10
+
+    - name: Apply CSMR topology node labels to encode Paxos ring membership
+      command: "kubectl label node {{ item.0.key }} {{ item.1 }} --overwrite"
+      environment:
+        KUBECONFIG: "/home/{{ ansible_user }}/.kube/config"
+      loop: "{{ csmr_labels | dict2items | subelements('value') }}"
+      loop_control:
+        label: "{{ item.0.key }}: {{ item.1 }}"
+      # --overwrite keeps re-runs idempotent. Labels feed topology-aware
+      # scheduling (ZooKeeper / sticky Paxos endpoints) in later deploy stages
+      # and document the fault-tolerance boundary (f=1) directly in cluster
+      # metadata.
+
+
+- name: Phase 5 - Smoke test (self-confirm cluster + CSMR topology labels)
+  hosts: k3s_master
+  become: yes
+  become_user: "{{ ansible_user }}"
+  gather_facts: no
+  tasks:
+
+    - name: Capture node status with labels for self-verification
+      command: kubectl get nodes --show-labels
+      environment:
+        KUBECONFIG: "/home/{{ ansible_user }}/.kube/config"
+      register: _nodes
+      # Fail the run unless the full topology is present in the node list. This
+      # is the authoritative gate: a missing/renamed node (e.g. a box whose OS
+      # hostname is not exactly vortex-N) would leave a label off and break
+      # quorum/dispatch in later deploy stages, so we surface it here instead of
+      # letting a "PLAY RECAP ok" mask a silent topology gap.
+      failed_when: >-
+        'Ready' not in _nodes.stdout
+        or 'csmr-role=proxy' not in _nodes.stdout
+        or 'csmr-role=replica0' not in _nodes.stdout
+        or 'csmr-role=replica1' not in _nodes.stdout
+        or 'csmr-role=replica2' not in _nodes.stdout
+        or 'csmr-zookeeper=true' not in _nodes.stdout
+
+    - name: Show node status and labels
+      debug:
+        msg: "{{ _nodes.stdout }}"
