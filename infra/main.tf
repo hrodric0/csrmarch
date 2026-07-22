@@ -402,6 +402,17 @@ resource "kubernetes_stateful_set" "proxy" {
             name           = "http"
           }
 
+          port {
+            # Dedicated Actuator management port — Spring Boot runs this as a
+            # SEPARATE Tomcat connector backed by its OWN thread pool, fully
+            # isolated from the 8080 request path that blocks on the synchronous
+            # Paxos fan-out. Liveness/readiness probes run here so request-path
+            # saturation can NEVER starve the probe of a worker thread (root-cause
+            # fix for the proxy exit-143 SIGTERM restarts under 10x load).
+            container_port = 8081
+            name           = "mgmt"
+          }
+
           env {
             name  = "ZOOKEEPER_CONNECT"
             value = "zookeeper.${var.namespace}.svc.cluster.local:2181"
@@ -428,30 +439,33 @@ resource "kubernetes_stateful_set" "proxy" {
 
           liveness_probe {
             http_get {
-              path = "/api/health"
-              port = 8080
+              path = "/actuator/health"
+              port = 8081
             }
-            # Raised from timeout 1s / failure_threshold 3 to 5s / 6 during the
-            # 10x stress run: under CONCURRENCY=320 every http-nio-8080-exec
-            # Tomcat thread is blocked on the synchronous Paxos fan-out (the
-            # lock ring's tail is ~3s), so /api/health can't get a thread within
-            # 1s. The default probe then SIGTERMs the proxy (exit 143) NOT
-            # because it's dead but because it's busy. Widening the budget lets
-            # the probe ride out the saturation window the way a real client
-            # (with --max-time) does, instead of killing a healthy replica.
+            # Now served on the DEDICATED management port (8081, own Tomcat
+            # connector + thread pool). Because the 8080 request path that
+            # blocks on the synchronous Paxos fan-out can no longer starve this
+            # probe, a tight budget is safe AND correct: the probe only fails
+            # when the process is genuinely dead (JVM down / composition table
+            # never loaded). The earlier widening to 5s/6 was an infra band-aid
+            # for the old design; with the decoupled port we return to a tight,
+            # fast fail so a truly-dead pod is killed quickly without ever
+            # killing a merely-busy one.
             initial_delay_seconds = 15
             period_seconds        = 10
-            timeout_seconds       = 5
-            failure_threshold     = 6
+            timeout_seconds       = 3
+            failure_threshold     = 3
           }
 
           readiness_probe {
             http_get {
-              path = "/api/health"
-              port = 8080
+              path = "/actuator/health"
+              port = 8081
             }
             initial_delay_seconds = 10
             period_seconds        = 5
+            timeout_seconds       = 3
+            failure_threshold     = 3
           }
 
           resources {
@@ -613,7 +627,7 @@ module "log" {
   # OOMs the default 256Mi and wedges the `put` fan-out (proxy puts route to
   # BOTH KVS and logger). Bump to 1Gi so the 10x stress test exercises the
   # CSMR architecture, not the app's heap ceiling. Nodes at ~14% mem.
-  app_memory_limit   = "1Gi"
+  app_memory_limit = "1Gi"
 
   depends_on = [kubernetes_stateful_set.zookeeper, kubernetes_deployment.control_plane]
 }

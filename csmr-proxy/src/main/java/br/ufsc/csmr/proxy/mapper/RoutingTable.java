@@ -406,6 +406,20 @@ public class RoutingTable {
     }
 
     /**
+     * Number of routing/composition rules loaded into the table.
+     *
+     * <p>Used by {@code CsmrProxyHealthIndicator} as the liveness signal: a proxy that
+     * booted but failed to load its composition table (table.size() == 0) has no route
+     * for any command and would 400 every request, so it must report itself DOWN until
+     * the table is populated. Process-level readiness only — this intentionally does NOT
+     * reflect downstream Paxos ring saturation (which is a normal draining condition,
+     * not a process fault).</p>
+     */
+    public int getCompositionRuleCount() {
+        return table.size();
+    }
+
+    /**
      * Adds a route programmatically (useful for testing).
      */
     public void addRoute(String command, RouteDefinition routeDef) {

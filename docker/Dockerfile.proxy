@@ -29,7 +29,10 @@ WORKDIR /app
 
 COPY csmr-proxy/target/csmr-proxy-*.jar app.jar
 
-EXPOSE 8080
+# 8080 = client request path; 8081 = dedicated Actuator management port
+# (own Tomcat connector + thread pool) that serves liveness/readiness, so
+# request-path saturation can never star the K8s probe (exit-143 fix).
+EXPOSE 8080 8081
 
 ENTRYPOINT ["java", \
   "-Xms128m", "-Xmx768m", \

@@ -64,6 +64,7 @@ services:
       dockerfile: docker/Dockerfile.proxy
     ports:
       - "8080:8080"
+      - "8081:8081"
     environment:
       ZOOKEEPER_CONNECT: "zookeeper:2181"
       # Empty (default) => proxy loads the bundled classpath composition. The E2E

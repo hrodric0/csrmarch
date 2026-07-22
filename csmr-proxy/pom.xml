@@ -51,6 +51,17 @@
             <version>${project.version}</version>
         </dependency>
 
+        <!-- Actuator — exposes /actuator/health on a SEPARATE management
+             port (8081) so Kubernetes liveness/readiness probes run on their
+             own Tomcat connector + thread pool, isolated from the request path
+             (8080) that blocks on the synchronous Paxos fan-out. This is the
+             root-cause fix for proxy SIGTERM (exit 143) restarts under 10x
+             saturation: the probe can never be starved of a worker thread. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
         <!-- Testing -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
