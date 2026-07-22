@@ -449,8 +449,13 @@ resource "kubernetes_stateful_set" "proxy" {
               memory = "256Mi"
               cpu    = "200m"
             }
+            # Raised 512Mi -> 1024Mi: the capacity test drives 32 concurrent
+            # multi-ring fan-outs through the proxy, which (under a single pinned
+            # replica) exceeds 512Mi and triggers OOMKills. Combined with
+            # sessionAffinity=None (load spread across replicas) this removes the
+            # wedge. Nodes sit at ~14% memory, so 1Gi is safe headroom.
             limits = {
-              memory = "512Mi"
+              memory = "1024Mi"
               cpu    = "1000m"
             }
           }
@@ -503,8 +508,13 @@ resource "kubernetes_service" "proxy_svc" {
       node_port   = var.proxy_node_port
     }
 
-    # Load balance across all healthy proxy replicas
-    session_affinity = "ClientIP"
+    # Load balance across all healthy proxy replicas. With a single client host,
+    # ClientIP affinity pins EVERY request to ONE replica; under the capacity
+    # test (32 in-flight, each fanning out to ~6 sidecars) that lone proxy
+    # exhausts its 512Mi limit and gets OOMKilled (restarts -> intermittent
+    # test failures). Use None so the NodePort round-robins across all 3 proxy
+    # replicas and the load is actually distributed.
+    session_affinity = "None"
   }
 
   depends_on = [kubernetes_stateful_set.proxy]
