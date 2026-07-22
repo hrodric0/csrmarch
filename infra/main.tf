@@ -71,7 +71,10 @@ resource "kubernetes_namespace" "csmr_poc" {
 # using the confluentinc image (same image docker-compose uses, so the CLI
 # and env shape are identical). It is pinned to vortex-1 via the
 # `csmr-zookeeper=true` label that Ansible Phase 4 applied to that node.
-# Bare metal has no PVC story we trust, so we persist only to emptyDir.
+# Bare metal has no PVC story we trust, so instead of emptyDir (which was
+# wiped on every pod restart and dropped ZK below clients' remembered
+# lastZxid — the "Refusing session request" wedge) we use a hostPath on
+# vortex-1 that survives pod restarts and keeps the transaction log durable.
 
 resource "kubernetes_stateful_set" "zookeeper" {
   metadata {
@@ -156,8 +159,14 @@ resource "kubernetes_stateful_set" "zookeeper" {
             period_seconds        = 10
           }
 
-          # No durable claim in the PoC: ZK data lives on the node's ephemeral
-          # emptyDir. Ring topology is rebuilt by sidecars on restart.
+          # Durable node-local storage: the ZK pod is pinned to vortex-1
+          # (node_selector csmr-zookeeper=true), so a hostPath at a fixed path
+          # on that node survives pod restarts and keeps ZK's zxid monotonic.
+          # This is what fixes the "Refusing session request ... our last zxid
+          # is 0x119 client must try another server" wedge: with emptyDir the
+          # data dir was wiped on every restart, dropping ZK below clients'
+          # remembered lastZxid. hostPath + DirectoryOrCreate needs no PVC and
+          # no manual provisioning step (the path is created on first mount).
           volume_mount {
             name       = "zk-data"
             mount_path = "/var/lib/zookeeper/data"
@@ -179,13 +188,22 @@ resource "kubernetes_stateful_set" "zookeeper" {
           }
         }
 
+        # hostPath on vortex-1: persists across ZK pod restarts so the
+        # ensemble zxid never resets under live clients. Path is created
+        # (DirectoryOrCreate) on first mount — no provisioning needed.
         volume {
           name = "zk-data"
-          empty_dir {}
+          host_path {
+            path = "/var/lib/csmr/zookeeper/data"
+            type = "DirectoryOrCreate"
+          }
         }
         volume {
           name = "zk-log"
-          empty_dir {}
+          host_path {
+            path = "/var/lib/csmr/zookeeper/log"
+            type = "DirectoryOrCreate"
+          }
         }
       }
     }
