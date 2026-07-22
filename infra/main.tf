@@ -431,8 +431,18 @@ resource "kubernetes_stateful_set" "proxy" {
               path = "/api/health"
               port = 8080
             }
+            # Raised from timeout 1s / failure_threshold 3 to 5s / 6 during the
+            # 10x stress run: under CONCURRENCY=320 every http-nio-8080-exec
+            # Tomcat thread is blocked on the synchronous Paxos fan-out (the
+            # lock ring's tail is ~3s), so /api/health can't get a thread within
+            # 1s. The default probe then SIGTERMs the proxy (exit 143) NOT
+            # because it's dead but because it's busy. Widening the budget lets
+            # the probe ride out the saturation window the way a real client
+            # (with --max-time) does, instead of killing a healthy replica.
             initial_delay_seconds = 15
             period_seconds        = 10
+            timeout_seconds       = 5
+            failure_threshold     = 6
           }
 
           readiness_probe {
@@ -453,9 +463,14 @@ resource "kubernetes_stateful_set" "proxy" {
             # multi-ring fan-outs through the proxy, which (under a single pinned
             # replica) exceeds 512Mi and triggers OOMKills. Combined with
             # sessionAffinity=None (load spread across replicas) this removes the
-            # wedge. Nodes sit at ~14% memory, so 1Gi is safe headroom.
+            # wedge. Nodes sit at ~14% memory, so headroom is plentiful.
+            # Bumped to 2048Mi for the 10x stress run: at CONCURRENCY=320 each
+            # proxy replica carries ~107 concurrent multi-ring fan-outs; 1Gi was
+            # close to the edge there and we want the stress test to exercise the
+            # CSMR architecture (consensus/routing), not re-trip the proxy OOM
+            # memory ceiling.
             limits = {
-              memory = "1024Mi"
+              memory = "2048Mi"
               cpu    = "1000m"
             }
           }
@@ -594,6 +609,11 @@ module "log" {
   zk_connect          = "zookeeper.${var.namespace}.svc.cluster.local:2181"
   stable_storage_type = "InMemory"
   stable_storage_size = "2Gi"
+  # The log app keeps an unbounded in-memory append log. At 10x volume this
+  # OOMs the default 256Mi and wedges the `put` fan-out (proxy puts route to
+  # BOTH KVS and logger). Bump to 1Gi so the 10x stress test exercises the
+  # CSMR architecture, not the app's heap ceiling. Nodes at ~14% mem.
+  app_memory_limit   = "1Gi"
 
   depends_on = [kubernetes_stateful_set.zookeeper, kubernetes_deployment.control_plane]
 }

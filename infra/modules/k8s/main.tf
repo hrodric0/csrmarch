@@ -24,6 +24,17 @@ variable "replicas" { type = number }
 variable "app_image" { type = string }
 variable "sidecar_image" { type = string }
 variable "image_pull_policy" { type = string }
+
+# Per-ring memory ceiling for the SMR app container. Defaults to 256Mi (the
+# original PoC value) but the Log ring keeps an unbounded in-memory append log,
+# so at 10x load volume it OOMs there and stalls the `put` fan-out (which routes
+# to BOTH KVS and logger). Bare-metal nodes sit at ~14% memory, so giving the
+# logger 1Gi is pure headroom, not a trade-off.
+variable "app_memory_limit" {
+  type        = string
+  description = "Memory limit for the SMR app container (Log ring needs more at 10x volume)"
+  default     = "256Mi"
+}
 variable "app_port" { type = number }
 variable "sidecar_port" { type = number }
 variable "ring_id_prefix" { type = string }
@@ -178,7 +189,7 @@ resource "kubernetes_stateful_set" "app" {
               cpu    = "100m"
             }
             limits = {
-              memory = "256Mi"
+              memory = var.app_memory_limit
               cpu    = "500m"
             }
           }
